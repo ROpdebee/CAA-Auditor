@@ -12,6 +12,7 @@ aiohttp = "^3.7.4"
 backoff = "^1.10.0"
 loguru = "^0.5.3"
 aiopath = "^0.5.0"
+attr = "^0.3.1"
 
 [tool.poetry.dev-dependencies]
 
