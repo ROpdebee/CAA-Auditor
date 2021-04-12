@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "caa_audit"
+version = "0.1.0"
+description = ""
+authors = ["Ruben Opdebeeck <ropdebee@vub.be>"]
+license = "GPL-2.0"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+tqdm = "^4.60.0"
+aiohttp = "^3.7.4"
+backoff = "^1.10.0"
+loguru = "^0.5.3"
+aiopath = "^0.5.0"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
