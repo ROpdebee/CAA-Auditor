@@ -45,7 +45,7 @@ rel_id_to_dates: dict[str, set[str]]
 
 def _load_rows(table_name: str) -> Sequence[Sequence[str]]:
     with (TABLE_DUMP_PATH / table_name).open() as f:
-        return [line.split('\t') for line in tqdm(f, desc=f'Loading {table_name}')]
+        return [line.strip().split('\t') for line in tqdm(f, desc=f'Loading {table_name}')]
 
 art_types = {
         type_id: type_name
