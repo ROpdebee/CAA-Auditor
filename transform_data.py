@@ -24,7 +24,7 @@ DUMP_PATH = Path(sys.argv[1])
 TABLE_DUMP_PATH = DUMP_PATH / 'mbdump'
 OUT_PATH = Path(sys.argv[2])
 
-APPROVED_EDIT_STATUSES: Sequence[int] = ()
+APPROVED_EDIT_STATUSES: Sequence[int] = (2,)
 ASIN_RGX = r'https?://(?:www\.)?amazon\.\w{2,3}/gp/product/(\w+)'
 
 _: Any
@@ -71,7 +71,6 @@ artist_credit_to_artist_ids = defaultdict(list)
 for ac_id, _, artist_id, *_ in _load_rows('artist_credit_name'):
     artist_credit_to_artist_ids[ac_id].append(artist_id)
 
-assert False, 'APPROVED_EDIT_STATUSES not implemented yet'
 edit_to_opened = {
     edit_id: edit_status in APPROVED_EDIT_STATUSES
     for edit_id, _, _, edit_status, *_ in _load_rows('edit')
@@ -95,7 +94,7 @@ rel_id_to_release = {
 }
 
 def row_to_date(row: Sequence[str]) -> str:
-    ymd = [('????' if s == '\\N' else s) for s in row[2:]]
+    ymd = [('????' if s == '\\N' else s) for s in row]
     date = '-'.join(ymd)
     date = re.sub(r'(?:-\?\?){1,2}$', '', date)
     if date == '????':
@@ -105,7 +104,11 @@ def row_to_date(row: Sequence[str]) -> str:
 
 rel_id_to_dates = defaultdict(set)
 for row in _load_rows('release_country'):
-    date = row_to_date(row)
+    date = row_to_date(row[2:])
+    if date:
+        rel_id_to_dates[row[0]].add(date)
+for row in _load_rows('release_unknown_country'):
+    date = row_to_date(row[1:])
     if date:
         rel_id_to_dates[row[0]].add(date)
 

@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 from typing import Any, Optional, TYPE_CHECKING
 
-import asyncio
 import json
 import textwrap
 from pathlib import Path
@@ -25,11 +26,6 @@ class AuditTask:
             self, mbstate: dict[str, Any], audit_path: Path,
             session: ClientSession, logger: Logger
     ) -> None:
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            logger.info(f'Creating audit task for {mbstate["release_gid"]} in runner {current_task.get_name()}')
-        else:
-            logger.info(f'Creating audit task for {mbstate["release_gid"]} in global runner')
         self._mbstate = mbstate
         self._mbid = mbstate['release_gid']
         self._audit_path = AsyncPath(audit_path)
@@ -98,6 +94,14 @@ class AuditTask:
 
         self._logger.info('Metadata fetched')
         yield CheckPassed(self._mbid, 'Item::exists')
+
+        self._logger.info('Checking whether there are any pending catalog tasks…')
+        if await self._ia_item.has_pending_tasks():
+            self._logger.info('Item has pending tasks and may get modified later. Aborting…')
+            yield ItemSkipped(self._mbid, 'Item::has pending tasks')
+            return
+
+        self._logger.info('No pending tasks, continuing with audit')
 
         self._logger.info('Checking whether item is dark…')
         if ia_meta.get('is_dark', False):

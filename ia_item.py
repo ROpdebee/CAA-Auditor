@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any, Optional, TYPE_CHECKING
 
 import json
@@ -98,6 +100,21 @@ class IAItem:
         if index_content is not None:
             await cache_file_path.write_text(index_content)
         return index_content
+
+    @backoff.on_exception(
+            backoff.expo, aiohttp.ClientError, max_tries=10,
+            on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
+    @backoff.on_exception(
+            backoff.expo, IAException, max_tries=5,
+            on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
+    async def has_pending_tasks(self) -> bool:
+        async with self._session.get('https://archive.org/services/tasks.php', params={
+                'summary': 1,
+                'identifier': self._identifier}) as resp:
+            summary = await resp.json()
+            if not summary['success']:
+                raise IAException(summary.get('error'))
+            return any(v != 0 for v in summary['value']['summary'].values())
 
     async def _load_from_cache(self, path: AsyncPath, *, as_json: bool) -> Optional[Any]:
         if not await path.is_file():
