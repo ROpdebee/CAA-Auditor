@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 import pendulum
+from tqdm import tqdm
 
 DUMP_PATH = Path(sys.argv[1])
 TABLE_DUMP_PATH = DUMP_PATH / 'mbdump'
@@ -44,7 +45,7 @@ rel_id_to_dates: dict[str, set[str]]
 
 def _load_rows(table_name: str) -> Sequence[Sequence[str]]:
     with (TABLE_DUMP_PATH / table_name).open() as f:
-        return [line.split('\t') for line in f]
+        return [line.split('\t') for line in tqdm(f, desc=f'Loading {table_name}')]
 
 art_types = {
         type_id: type_name
