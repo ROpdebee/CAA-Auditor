@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import json
 import sys
@@ -8,7 +8,9 @@ import aiohttp
 import backoff
 from aiopath import AsyncPath
 from async_property import async_property
-from loguru import Logger
+
+if TYPE_CHECKING:
+    from loguru import Logger
 
 class IAException(Exception):
     """Exceptions in IA responses."""
@@ -23,12 +25,12 @@ def handle_backoff(details):
         return
 
     if isinstance(exc, aiohttp.ClientResponseError):
-        that._logger.log(
+        that._logger.info(
                 '{tries}={status} {method} {url} {message}. Retry after {wait:0.1f}s…',
                 **details, url=exc.request_info.url, method=exc.request_info.method,
                 status=exc.status, message=exc.message)
     else:
-        that._logger.log(
+        that._logger.info(
                 '{tries} {message}. Retry after {wait:0.1f}s…',
                 **details, message=str(exc))
 
@@ -42,19 +44,19 @@ def handle_giveup(details):
         return
 
     if isinstance(exc, aiohttp.ClientResponseError):
-        that._logger.log(
+        that._logger.info(
                 '{tries}={status} {method} {url} {message}. Giving up after {elapsed:0.1f}s.',
                 **details, url=exc.request_info.url, method=exc.request_info.method,
                 status=exc.status, message=exc.message)
     else:
-        that._logger.log(
+        that._logger.info(
                 '{tries} {message}. Giving up after {elapsed:0.1f}s.',
                 **details, message=str(exc))
 
 
 def handle_success(details):
     that = details.args[0]
-    that._logger.log('{tries} Succeeded after {elapsed:0.1f}s.')
+    that._logger.info('{tries} Succeeded after {elapsed:0.1f}s.')
 
 
 class IAItem:
@@ -69,7 +71,7 @@ class IAItem:
         self._logger = logger
 
     @async_property
-    async def metadata(self) -> Dict[str, Any]:
+    async def metadata(self) -> dict[str, Any]:
         cache_file_path = self._cache_dir_path / 'ia_metadata.json'
         # Try loading cached copy
         cached = await self._load_from_cache(cache_file_path, as_json=True)
@@ -105,7 +107,7 @@ class IAItem:
             content = await path.read_text()
             if as_json:
                 content = json.loads(content)
-            self._logger.log(f'Loaded cached {path.name}')
+            self._logger.info(f'Loaded cached {path.name}')
             return content
         except OSError as exc:
             self._logger.error(f'Failed to load {path.name} from cache: {exc}')
@@ -117,12 +119,13 @@ class IAItem:
     @backoff.on_exception(
             backoff.expo, IAException, max_tries=5,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
-    async def _fetch_metadata(self) -> Dict[str, Any]:
+    async def _fetch_metadata(self) -> dict[str, Any]:
         """Fetch the metadata of the item.
 
         :returns:   The metadata. May be empty dict if item doesn't exist.
         """
         url = f'https://archive.org/metadata/{self._identifier}'
+        self._logger.info(f'Loading {url}')
         async with self._session.get(url) as resp:
             resp.raise_for_status()
             metadata = await resp.json()
@@ -131,6 +134,7 @@ class IAItem:
                 raise IAException(metadata['error'])
 
             # Empty metadata, should be 404
+            self._logger.info('Got empty metadata, item should be 404')
             if not metadata and not await self._is_404():
                 raise IAException('Empty response on non-404 item')
 
@@ -145,6 +149,7 @@ class IAItem:
         :returns:   The index.json content, or None is it doesn't exist.
         """
         url = f'https://archive.org/download/{self._identifier}/index.json'
+        self._logger.info(f'Loading {url}')
         async with self._session.get(url) as resp:
             # Allow 404, it's a possible problem
             if resp.status == 404:
@@ -159,5 +164,6 @@ class IAItem:
             backoff.expo, aiohttp.ClientError, max_tries=10,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _is_404(self) -> bool:
+        self._logger.info(f'Checking whether {self._identifier} is 404')
         async with self._session.get(f'https://archive.org/details/{self._identifier}') as resp:
             return resp.status == 404

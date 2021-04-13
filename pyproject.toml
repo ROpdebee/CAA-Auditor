@@ -6,15 +6,17 @@ authors = ["Ruben Opdebeeck <ropdebee@vub.be>"]
 license = "GPL-2.0"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.9"
 tqdm = "^4.60.0"
 aiohttp = "^3.7.4"
 backoff = "^1.10.0"
 loguru = "^0.5.3"
 aiopath = "^0.5.0"
 attr = "^0.3.1"
+pendulum = "^2.1.2"
 
 [tool.poetry.dev-dependencies]
+mypy = "^0.812"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

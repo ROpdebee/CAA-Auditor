@@ -1,23 +1,32 @@
-from typing import Sequence
+from __future__ import annotations
+
+from typing import Any, ClassVar, TYPE_CHECKING
 
 from enum import Enum
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 import attr
 
 @attr.s(auto_attribs=True)
 class CheckResult:
+    check_state: ClassVar[str]
     mbid: str
-    description: str
+    check_description: str
+    additional_data: Any = None
 
     @property
     def category(self) -> Sequence[str]:
-        return self.description.split('::')
+        return self.check_description.split('::')
 
 class ItemSkipped(CheckResult):
-    pass
+    check_state = 'ITEM SKIPPED'
 
 class CheckPassed(CheckResult):
-    pass
+    check_state = 'PASSED'
 
 class CheckFailed(CheckResult):
-    pass
+    check_state = 'FAILED'
+
+class CheckSkipped(CheckResult):
+    check_state = 'SKIPPED'
