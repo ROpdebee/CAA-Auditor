@@ -2,165 +2,148 @@
 
 Currently using data dumps, could be adapted to use a DB instance.
 
-Call with root MB dump path as first arg, and output file as second arg.
+Call with output file as first arg and the following environment values set:
+MB_USER = The postgresql user that has access to the MB database.
+MB_PASS = Its password
+MB_HOST = MB DB host
+MB_DB = Database name of the DB
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any
 
 import json
+import os
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
 import pendulum
+from mbdata.models import (
+        Artist, ArtistCredit, ArtistCreditName, ArtType, CoverArt, CoverArtType,
+        ImageType, Language, Link, LinkReleaseURL, LinkType, Release, ReleaseCountry,
+        ReleaseUnknownCountry, URL)
+from mbdata.types import PartialDate
+from sqlalchemy import create_engine
+from sqlalchemy.orm import backref, joinedload, load_only, raiseload, relationship, sessionmaker, Load
 from tqdm import tqdm
 
-DUMP_PATH = Path(sys.argv[1])
-TABLE_DUMP_PATH = DUMP_PATH / 'mbdump'
-OUT_PATH = Path(sys.argv[2])
+if not {'MB_USER', 'MB_PASS', 'MB_HOST', 'MB_DB'}.issubset(os.environ.keys()):
+    raise ValueError('Missing required environment arguments')
 
-APPROVED_EDIT_STATUSES: Sequence[int] = (2,)
-ASIN_RGX = r'https?://(?:www\.)?amazon\.\w{2,3}/gp/product/(\w+)'
+MB_USER = os.environ['MB_USER']
+MB_PASS = os.environ['MB_PASS']
+MB_HOST = os.environ['MB_HOST']
+MB_DB = os.environ['MB_DB']
+DB_CONN_ADDR = f'postgresql://{MB_USER}:{MB_PASS}@{MB_HOST}/{MB_DB}'
+OUT_PATH = Path(sys.argv[1])
 
-_: Any
+APPROVED_EDIT_STATUSES = (2,)
 
-# DATA
-art_id_to_types: dict[str, set[str]]
-artist_id_to_gid: dict[str, str]
-artist_id_to_name: dict[str, str]
-artist_credit_to_artist_ids: dict[str, list[str]]
-edit_to_opened: dict[str, bool]
-lang_id_to_lang: dict[str, str]
-url_to_asin: dict[str, str]
-rel_id_to_urls: dict[str, list[str]]
-rel_id_to_release: dict[str, Sequence[str]]
-rel_id_to_covers: dict[str, list[list[str]]]
-rel_id_to_dates: dict[str, set[str]]
+engine = create_engine(DB_CONN_ADDR)
+Session = sessionmaker(bind=engine)
+session = Session()
 
-def _load_rows(table_name: str) -> Sequence[Sequence[str]]:
-    with (TABLE_DUMP_PATH / table_name).open() as f:
-        return [line.strip().split('\t') for line in tqdm(f, desc=f'Loading {table_name}')]
+all_caa_ids = session.query(CoverArt.release_id).order_by(CoverArt.release_id).distinct().all()
 
-art_types = {
-        type_id: type_name
-        for type_id, type_name, *_ in _load_rows('cover_art_archive.art_type')}
+CoverArt.release = relationship('Release', foreign_keys=[CoverArt.release_id], innerjoin=True, backref=backref('cover_arts', order_by='CoverArt.ordering', viewonly=True))
+CoverArtType.cover_art = relationship('CoverArt', foreign_keys=[CoverArtType.id], innerjoin=True, backref=backref('types', viewonly=True))
 
-art_mime_types_to_ext = {
-        mime_type: extension
-        for mime_type, extension in _load_rows('cover_art_archive.image_type')
-}
+def stringify_date(date: PartialDate) -> str:
+    year = f'{date.year:04d}' if date.year is not None else '????'
+    month = f'{date.month:02d}' if date.month is not None else '??'
+    day = f'{date.day:02d}' if date.day is not None else '??'
 
-art_id_to_types = defaultdict(set)
-for cover_id, type_id in _load_rows('cover_art_archive.cover_art_type'):
-    art_id_to_types[cover_id].add(art_types[type_id])
-
-del art_types
-
-artist_id_to_gid = {}
-artist_id_to_name = {}
-for a_rowid, a_gid, a_name, *_ in _load_rows('artist'):
-    artist_id_to_gid[a_rowid] = a_gid
-    artist_id_to_name[a_rowid] = a_name
-
-artist_credit_to_artist_ids = defaultdict(list)
-for ac_id, _, artist_id, *_ in _load_rows('artist_credit_name'):
-    artist_credit_to_artist_ids[ac_id].append(artist_id)
-
-edit_to_opened = {
-    edit_id: edit_status in APPROVED_EDIT_STATUSES
-    for edit_id, _, _, edit_status, *_ in _load_rows('edit')
-}
-
-lang_id_to_lang = {
-    row[0]: row[-1] for row in _load_rows('language')
-}
-
-url_to_asin = {
-    url_id: match.groups()[0] for url_id, _, url, *_ in _load_rows('url')
-    if (match := re.match(ASIN_RGX, url)) is not None
-}
-
-rel_id_to_urls = defaultdict(list)
-for _, _, rel_id, url_id in _load_rows('l_release_url'):
-    rel_id_to_urls[rel_id].append(url_id)
-
-rel_id_to_release = {
-    row[0]: row for row in _load_rows('release')
-}
-
-def row_to_date(row: Sequence[str]) -> str:
-    ymd = [('????' if s == '\\N' else s) for s in row]
-    date = '-'.join(ymd)
+    date = '-'.join((year, month, day))
     date = re.sub(r'(?:-\?\?){1,2}$', '', date)
     if date == '????':
         date = ''
 
     return date
 
-rel_id_to_dates = defaultdict(set)
-for row in _load_rows('release_country'):
-    date = row_to_date(row[2:])
-    if date:
-        rel_id_to_dates[row[0]].add(date)
-for row in _load_rows('release_unknown_country'):
-    date = row_to_date(row[1:])
-    if date:
-        rel_id_to_dates[row[0]].add(date)
+mime_type_to_ext = {
+    mime: ext
+    for (mime, ext) in session.query(ImageType.mime_type, ImageType.suffix).all()
+}
 
-rel_id_to_covers = defaultdict(list)
-for cover_row in _load_rows('cover_art_archive.cover_art'):
-    cover_id, rel_id, comment, edit_id, order, _, _, mime_type, *_ = row
-    rel_id_to_covers[rel_id].append([cover_id, comment, edit_id, order, mime_type])
+ca_type_id_to_name = {
+    ca_type.id: ca_type.name
+    for ca_type in session.query(ArtType).all()
+}
 
-for cover_list in rel_id_to_covers.values():
-    cover_list.sort(key=lambda row: int(row[3]))
+# Not very scalable, but quicker than a separate query
+amzn_link_id = session.query(LinkType.id).filter_by(name='amazon asin').one()[0]
+rels_and_amzn_urls = (session.query(LinkReleaseURL.release_id, URL.url)
+        .join(URL, Link)
+        .filter_by(link_type_id=amzn_link_id)
+        .all())
+rel_ids_to_asins: dict[str, set[str]] = defaultdict(set)
+for (rel_id, amzn_url) in rels_and_amzn_urls:
+    asin = amzn_url.split('/')[-1]
+    assert len(asin) == 10 and asin.isalnum()
+    rel_ids_to_asins[rel_id].add(asin)
+del rels_and_amzn_urls
 
-db_timestamp = (TABLE_DUMP_PATH / 'TIMESTAMP').read_text().strip()
+# Again, caching this here to save on a merge
+lang_id_to_iso = {
+    lang_id: iso_code
+    for lang_id, iso_code in session.query(Language.id, Language.iso_code_3)
+}
+
+
+def extract_cover(cover: CoverArt) -> dict[str, Any]:
+    return {
+        'id': cover.id,
+        'edit_id': cover.edit_id,
+        'edit_approved': cover.edit.status in APPROVED_EDIT_STATUSES,
+        'comment': cover.comment,
+        'types': [ca_type_id_to_name[cover_type.type_id] for cover_type in cover.types],
+        'extension': mime_type_to_ext[cover.mime_type],
+    }
+
+def extract_data(id: int) -> dict[str, Any]:
+    release = (session.query(Release)
+            .options(
+                load_only('id', 'gid', 'barcode', 'language_id'),
+                (joinedload(Release.artist_credit, innerjoin=True)
+                    .joinedload(ArtistCredit.artists, innerjoin=True)
+                    .joinedload(ArtistCreditName.artist, innerjoin=True)
+                    .load_only('gid', 'name')),
+                joinedload(Release.country_dates).load_only('date_year', 'date_month', 'date_day'),
+                joinedload(Release.unknown_country_dates).load_only('date_year', 'date_month', 'date_day'),
+                (joinedload(Release.cover_arts)
+                    .options(
+                        joinedload(CoverArt.types),
+                        joinedload(CoverArt.edit).load_only('status')))
+            )
+            .filter_by(id=id)
+            .one())
+    dates = [
+        stringify_date(rel_date.date)
+        for rel_date in (*release.country_dates, *release.unknown_country_dates)]
+
+    return {
+        'release_gid': release.gid,
+        'release_name': release.name,
+        'artists': [
+            {
+                'artist_gid': ac_name.artist.gid,
+                # IA seems to use normal name, not as credited
+                'artist_name': ac_name.artist.name,
+            } for ac_name in release.artist_credit.artists
+        ],
+        'language_code': release.language_id is not None and lang_id_to_iso[release.language_id],
+        'barcode': release.barcode,
+        'asins': list(rel_ids_to_asins[release.id]),
+        'release_dates': dates,
+        'covers': [extract_cover(cover) for cover in release.cover_arts],
+    }
 
 with OUT_PATH.open('w') as out_f:
-    for rel_id, covers in rel_id_to_covers.items():
-        rel_row = rel_id_to_release[rel_id]
-        _, rel_gid, rel_name, ac_id, *_ = rel_row
-        lid = rel_row[7]
-        barcode = rel_row[9]
+    for (caa_id,) in tqdm(all_caa_ids, desc='Extract data'):
+        mb_data = extract_data(caa_id)
+        mb_data_json = json.dumps(mb_data)
+        out_f.write(mb_data_json + os.linesep)
 
-        info = {
-            'release_gid': rel_gid,
-            'release_name': rel_name,
-            'artists': [
-                {
-                    'artist_gid': artist_id_to_gid[artist_id],
-                    # IA seems to use normal name, not as credited
-                    'artist_name': artist_id_to_name[artist_id],
-                } for artist_id in artist_credit_to_artist_ids[ac_id]
-            ],
-            'language_code': lang_id_to_lang[lid],
-            'barcode': barcode,
-            'asins': [
-                url_to_asin[url_id]
-                for url_id in rel_id_to_urls[rel_id]
-                if url_id in url_to_asin
-            ],
-            'release_dates': list(rel_id_to_dates[rel_id]),
-            'covers': [
-                {
-                    'id': int(cover_id),
-                    'edit_id': int(edit_id),
-                    'edit_approved': not edit_to_opened[edit_id],
-                    'comment': comment,
-                    'types': art_id_to_types[cover_id],
-                    'extension': art_mime_types_to_ext[mime_type],
-                }
-                for cover_id, comment, edit_id, _, mime_type in rel_id_to_covers[rel_id]
-            ],
-            'max_last_modified': db_timestamp,
-        }
-
-        # One JSON-serialized dict per line, so we get JSONL
-        out_f.write(json.dumps(info))

@@ -18,6 +18,8 @@ tabulate = "^0.8.9"
 click = "^7.1.2"
 async-property = "^0.2.1"
 tqdm = "^4.60.0"
+mbdata = "^25.0.4"
+SQLAlchemy = "^1.4.7"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.812"
