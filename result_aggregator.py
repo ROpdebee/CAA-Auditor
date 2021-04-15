@@ -11,10 +11,23 @@ from tabulate import tabulate
 from audit_result import CheckFailed, CheckPassed, CheckResult, CheckSkipped, ItemSkipped
 from progress import ProgressBar
 
-class ResultAggregator:
+class ResultCollector:
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+
+    async def put(self, audit_results: list[CheckResult]) -> None:
+        raise NotImplementedError()
+
+class ResultAggregator(ResultCollector):
+    """Aggregator for results provided by the tasks."""
 
     def __init__(self, progress: ProgressBar) -> None:
-        self._lock = asyncio.Lock()
+        super().__init__()
         self._progress = progress
 
         self._failed_checks: list[CheckFailed] = []
@@ -22,10 +35,6 @@ class ResultAggregator:
         self._skipped_items: list[ItemSkipped] = []
         self._check_counter: Counter[tuple[str, str, str]] = Counter()
         self._item_skip_counter: Counter[str] = Counter()
-
-    @property
-    def lock(self) -> asyncio.Lock:
-        return self._lock
 
     async def put(self, audit_results: list[CheckResult]) -> None:
         if [res for res in audit_results if isinstance(res, ItemSkipped)]:

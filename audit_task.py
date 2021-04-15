@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from audit_result import CheckFailed, CheckPassed, CheckResult, CheckSkipped, ItemSkipped
 from ia_item import IAItem
 from index_schema import INDEX_SCHEMA
-from result_aggregator import ResultAggregator
+from result_aggregator import ResultCollector
 
 class AuditTask:
     def __init__(
@@ -32,7 +32,7 @@ class AuditTask:
         self._logger = logger
         self._ia_item = IAItem(f'mbid-{self._mbid}', audit_path, session, logger)
 
-    async def run(self, aggregator: ResultAggregator) -> None:
+    async def run(self, aggregator: ResultCollector) -> None:
         start_time = pendulum.now()
         self._logger.info(
                 f'STARTING AUDIT TASK FOR {self._mbid} AT {start_time.to_rfc1123_string()}')
@@ -59,7 +59,7 @@ class AuditTask:
                 elapsed=(end_time - start_time).total_seconds)
 
     async def _report_results(
-            self, results: list[CheckResult], aggregator: ResultAggregator
+            self, results: list[CheckResult], aggregator: ResultCollector
     ) -> None:
         await (self._audit_path / 'failures.log').write_text('\n'.join(
                 str(res) for res in results if isinstance(res, CheckFailed)))
