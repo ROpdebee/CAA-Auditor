@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 import asyncio
 import json
@@ -27,13 +27,25 @@ def _fanout_path(root_path: Path, mbid: str) -> Path:
 async def create_tasks(
         data_path: AsyncPath, root_path: Path, aiosession: ClientSession,
         logger: loguru.Logger
-) -> AsyncIterable[AuditTask]:
+) -> tuple[dict[str, Any], AsyncIterable[AuditTask]]:
     async with data_path.open('r') as data_f:
-        async for data_line in data_f:
-            mb_data = json.loads(data_line)
-            task_path = _fanout_path(root_path, mb_data['release_id'])
-            task_logger = logger.bind(log_path=task_path / 'audit.log')
-            yield AuditTask(mb_data, task_path, aiosession, task_logger)
+        meta_line = next(data_f)
+        audit_meta = json.loads(meta_line)
+        if audit_meta['state'] != 'meta':
+            raise ValueError('Expected first line of task list to be meta record')
+        return audit_meta, _create_task_stream(
+                data_f, pendulum.from_timestamp(audit_meta['max_last_modified']),
+                root_path, aiosession, logger)
+
+async def _create_task_stream(
+        task_f: Any, max_last_modified: pendulum.datetime.DateTime,
+        root_path: Path, aiosession: ClientSession, logger: loguru.Logger
+) -> AsyncIterable[AuditTask]:
+    async for data_line in task_f:
+        mb_data = json.loads(data_line)
+        task_path = _fanout_path(root_path, mb_data['id'])
+        task_logger = logger.bind(log_path=task_path / 'audit.log')
+        yield AuditTask(mb_data, max_last_modified, task_path, aiosession, task_logger)
 
 async def queue_tasks(
         tasks: AsyncIterable[AuditTask], task_q: asyncio.Queue[AuditTask],
@@ -81,10 +93,11 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int)
             connector=TCPConnector(limit=concurrency),
             headers={'Authorization': f'LOW {s3_access}:{s3_secret}'})
     async with session:
+        audit_meta, task_stream = await create_tasks(
+                AsyncPath(mb_data_file_path), output_path, session,
+                loguru.logger)
+        num_items = audit_meta['count']
         with ProgressBar(num_items) as progress:
-            task_stream = create_tasks(
-                    AsyncPath(mb_data_file_path), output_path, session,
-                    loguru.logger)
             queuer = asyncio.create_task(queue_tasks(task_stream, task_q, progress))
 
             aggregator = ResultAggregator(progress)
