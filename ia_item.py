@@ -19,7 +19,7 @@ class IAException(Exception):
 
 
 def handle_backoff(details):
-    that = details.args[0]
+    that = details['args'][0]
     exc = sys.exc_info()[1]
     if exc is None:
         # Shouldn't actually happen
@@ -29,16 +29,17 @@ def handle_backoff(details):
     if isinstance(exc, aiohttp.ClientResponseError):
         that._logger.info(
                 '{tries}={status} {method} {url} {message}. Retry after {wait:0.1f}s…',
-                **details, url=exc.request_info.url, method=exc.request_info.method,
+                tries=details['tries'], wait=details['wait'],
+                url=exc.request_info.url, method=exc.request_info.method,
                 status=exc.status, message=exc.message)
     else:
         that._logger.info(
                 '{tries} {message}. Retry after {wait:0.1f}s…',
-                **details, message=str(exc))
+                tries=details['tries'], wait=details['wait'], message=str(exc))
 
 
 def handle_giveup(details):
-    that = details.args[0]
+    that = details['args'][0]
     exc = sys.exc_info()[1]
     if exc is None:
         # Shouldn't actually happen
@@ -48,17 +49,20 @@ def handle_giveup(details):
     if isinstance(exc, aiohttp.ClientResponseError):
         that._logger.info(
                 '{tries}={status} {method} {url} {message}. Giving up after {elapsed:0.1f}s.',
-                **details, url=exc.request_info.url, method=exc.request_info.method,
+                tries=details['tries'], elapsed=details['elapsed'],
+                url=exc.request_info.url, method=exc.request_info.method,
                 status=exc.status, message=exc.message)
     else:
         that._logger.info(
                 '{tries} {message}. Giving up after {elapsed:0.1f}s.',
-                **details, message=str(exc))
+                tries=details['tries'], elapsed=details['elapsed'], message=str(exc))
 
 
 def handle_success(details):
-    that = details.args[0]
-    that._logger.info('{tries} Succeeded after {elapsed:0.1f}s.')
+    that = details['args'][0]
+    that._logger.info(
+            '{tries} Succeeded after {elapsed:0.4f}s.',
+            elapsed=details['elapsed'], tries=details['tries'])
 
 
 class IAItem:
@@ -102,10 +106,7 @@ class IAItem:
         return index_content
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=10,
-            on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
-    @backoff.on_exception(
-            backoff.expo, IAException, max_tries=5,
+            backoff.expo, (aiohttp.ClientError, IAException), max_tries=10,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def has_pending_tasks(self) -> bool:
         async with self._session.get('https://archive.org/services/tasks.php', params={
@@ -126,15 +127,12 @@ class IAItem:
                 content = json.loads(content)
             self._logger.info(f'Loaded cached {path.name}')
             return content
-        except OSError as exc:
+        except (json.JSONDecodeError, OSError) as exc:
             self._logger.error(f'Failed to load {path.name} from cache: {exc}')
             return None
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=10,
-            on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
-    @backoff.on_exception(
-            backoff.expo, IAException, max_tries=5,
+            backoff.expo, (aiohttp.ClientError, IAException), max_tries=10,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _fetch_metadata(self) -> dict[str, Any]:
         """Fetch the metadata of the item.
@@ -151,9 +149,10 @@ class IAItem:
                 raise IAException(metadata['error'])
 
             # Empty metadata, should be 404
-            self._logger.info('Got empty metadata, item should be 404')
-            if not metadata and not await self._is_404():
-                raise IAException('Empty response on non-404 item')
+            if not metadata:
+                self._logger.info('Got empty metadata, item should be 404')
+                if not await self._is_404():
+                    raise IAException('Empty response on non-404 item')
 
             return metadata
 

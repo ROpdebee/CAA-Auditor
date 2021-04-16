@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import json
+import re
 import textwrap
 from pathlib import Path
 
@@ -30,7 +31,7 @@ class AuditTask:
         self._record = task_record
         self._mbid = task_record['id']
         self._max_last_modified = max_last_modified
-        self._audit_path = AsyncPath(audit_path)
+        self.audit_path = AsyncPath(audit_path)
         self._logger = logger
         self._ia_item = IAItem(f'mbid-{self._mbid}', audit_path, session, logger)
 
@@ -44,7 +45,7 @@ class AuditTask:
             results = [res async for res in self._run()]
         except Exception as exc:
             had_exception = True
-            self._logger.exception(exc)
+            self._logger.opt(exception=True).critical(f'Internal error')
             results = [ItemSkipped(self._mbid, f'InternalError::{exc.__class__.__name__}', exc)]
 
         await self._report_results(results, aggregator)
@@ -54,16 +55,16 @@ class AuditTask:
         else:
             status_text = 'FINISHED'
         end_time = pendulum.now()
-        self._logger.error(
-                'AUDIT TASK FOR {mbid} {status_text} AT {end_time_str} (took {elapsed:0.1f}s)',
+        self._logger.info(
+                'AUDIT TASK FOR {mbid} {status_text} AT {end_time_str} (took {elapsed:0.4f}s)',
                 mbid=self._mbid, status_text=status_text,
                 end_time_str=end_time.to_rfc1123_string(),
-                elapsed=(end_time - start_time).total_seconds)
+                elapsed=(end_time - start_time).total_seconds())
 
     async def _report_results(
             self, results: list[CheckResult], aggregator: ResultCollector
     ) -> None:
-        await (self._audit_path / 'failures.log').write_text('\n'.join(
+        await (self.audit_path / 'failures.log').write_text('\n'.join(
                 str(res) for res in results if isinstance(res, CheckFailed)))
         async with aggregator.lock:
             await aggregator.put(results)
@@ -79,28 +80,28 @@ class AuditTask:
             self._logger.info('Summary:')
             max_desc_length = max(len(res.check_description) for res in results)
             for check_result in results:
-                self._logger.info(check_result.check_description.ljust(max_desc_length) + ' …' + check_result.check_state)
+                self._logger.info(check_result.check_description.ljust(max_desc_length) + ' … ' + check_result.check_state)
                 if isinstance(check_result, CheckFailed) and check_result.additional_data is not None:
                     self._logger.info('    Additional failure data:')
                     self._logger.info(textwrap.indent(str(check_result.additional_data), ' ' * 4))
 
     async def _run(self) -> AsyncIterable[CheckResult]:
         self._logger.info('Retrieving IA item metadata…')
-        ia_meta = self._ia_item.metadata
+        ia_meta = await self._ia_item.metadata
 
         if not ia_meta:
             # 404, BAD!
             self._logger.error('Received empty metadata, item does not exist! Aborting…')
-            yield CheckFailed(self._mbid, 'Item::exists')
+            yield CheckFailed(self._mbid, f'{self.base_category}::exists')
             return
 
         self._logger.info('Metadata fetched')
-        yield CheckPassed(self._mbid, 'Item::exists')
+        yield CheckPassed(self._mbid, f'{self.base_category}::exists')
 
         self._logger.info('Checking whether there are any pending catalog tasks…')
         if await self._ia_item.has_pending_tasks():
             self._logger.info('Item has pending tasks and may get modified later. Aborting…')
-            yield ItemSkipped(self._mbid, 'Item::has pending tasks')
+            yield ItemSkipped(self._mbid, f'{self.base_category}::has pending tasks')
             return
 
         self._logger.info('No pending tasks, continuing with audit')
@@ -108,12 +109,12 @@ class AuditTask:
         self._logger.info('Checking whether item is dark…')
         if ia_meta.get('is_dark', False):
             self._logger.info('Cannot audit this item since it is darkened. Aborting…')
-            yield ItemSkipped(self._mbid, 'Item::darkened')
+            yield ItemSkipped(self._mbid, f'{self.base_category}::darkened')
             return
 
         self._logger.info('Item is accessible!')
 
-        ia_last_modified = pendulum.from_timestamp(ia_meta['item_last_modified'])
+        ia_last_modified = pendulum.from_timestamp(ia_meta['item_last_updated'])
 
         if ia_last_modified >= self._max_last_modified:
             self._logger.info(''.join([
@@ -122,14 +123,14 @@ class AuditTask:
                     ', which is after the DB state as of ',
                     self._max_last_modified.to_rfc1123_string(),
                     '. Aborting…']))
-            yield ItemSkipped(self._mbid, 'Item::ia modified')
+            yield ItemSkipped(self._mbid, f'{self.base_category}::ia modified')
             return
 
         self._logger.info('IA item has not recently been modified.')
 
         if 'metadata' not in ia_meta:
             self._logger.error('Item missing IA metadata. Aborting…')
-            yield CheckFailed(self._mbid, 'Metadata::missing metadata key')
+            yield CheckFailed(self._mbid, f'{self.base_category}::Metadata::missing metadata key')
             return
 
         if self._record['state'] in ('active', 'empty'):
@@ -143,20 +144,25 @@ class AuditTask:
     async def _run_active_checks(self, ia_meta: dict[str, Any]) -> AsyncIterable[CheckResult]:
         mbstate = self._record['data']
 
+        self._logger.info('')
+
         async for metadata_check_result in self._run_metadata_checks(ia_meta, mbstate):
             yield metadata_check_result
 
-        self._logger.log('')
+        self._logger.info('')
 
         async for files_check_result in self._run_files_checks(ia_meta, mbstate):
             yield files_check_result
 
-        self._logger.log('')
+        self._logger.info('')
 
         async for index_check_result in self._run_index_checks(mbstate):
             yield index_check_result
 
     async def _run_deleted_checks(self, ia_meta: dict[str, Any]) -> AsyncIterable[CheckResult]:
+        start_time = pendulum.now()
+        self._logger.info('*** Starting IA deleted item checks')
+
         files = ia_meta.get('files', [])
 
         def has_any_file(pred: Callable[[dict[str, Any]], bool]) -> bool:
@@ -173,42 +179,41 @@ class AuditTask:
                         or name.startswith('history/files/index.json')))
             if not has_index:
                 self._logger.info('Possibly deleted item does not contain and never has contained index.json. Likely from test, aborting…')
-                yield ItemSkipped(self._mbid, 'DeletedItem::test item')
+                yield ItemSkipped(self._mbid, f'{self.base_category}::test item')
                 return
 
             self._logger.info('Item has/had an index, continuing.')
 
         # DeletedItem::index is absent
         yield self._simple_check(
-                'DeletedItem::index is absent',
+                'index is absent',
                 not has_any_file(lambda f: f.get('name') == 'index.json'),
                 'index.json file was removed',
                 'Item still has an index.json file which has not been removed')
 
         # DeletedItem::images are absent
         yield self._simple_check(
-                'DeletedItem::images is absent',
+                'images are absent',
                 not has_any_file(lambda f:
                     (f.get('name', '').split('.')[-1] in ('png', 'jpg', 'gif', 'pdf')
-                        and (not f.get('name', '').startswith('history/files/'))
+                        and f.get('name', '').startswith(f'mbid-{self._mbid}-')
                         and f.get('source', '') == 'original')),
                 'original images were removed',
                 'Item still has an original image which has not been removed')
 
         # DeletedItem::derivatives are absent
         yield self._simple_check(
-                'DeletedItem::derivatives are absent',
+                'derivatives are absent',
                 not has_any_file(lambda f:
                     (f.get('source', '') == 'derivative'
-                        and (not f.get('name', '').startswith('history/files/'))
-                        and f.get('original', '').startswith('history/files/'))),
+                        and f.get('name', '').startswith(f'mbid-{self._mbid}-'))),
                 'derived files were removed',
                 'Item still has a derived file which has not been removed, but its original has been')
 
         # DeletedItem::mb_metadata is absent
         yield self._simple_check(
-                'DeletedItem::mb_metadata is absent',
-                not has_any_file(lambda f: f.get('name') == 'mb_metadata.xml'),
+                'mb_metadata is absent',
+                not has_any_file(lambda f: f.get('name') == f'mbid-{self._mbid}_mb_metadata.xml'),
                 'mb_metadata.xml file was removed',
                 'Item still has an mb_metadata.xml file which has not been removed')
 
@@ -216,12 +221,25 @@ class AuditTask:
             # Only check this for deleted items, for merged ones, it still redirects
             # DeletedItem::release url is absent
             yield self._simple_check(
-                    'DeletedItem::release url is absent',
+                    'release url is absent',
                     # Below should also work if it's a singleton string instead of a list
-                    f'urn:mb_release_id:{self._mbid}' not in ia_meta.get('metadata', {}).get('external-identifier'),
+                    f'urn:mb_release_id:{self._mbid}' not in ia_meta.get('metadata', {}).get('external-identifier', []),
                     'release URN is removed from item',
                     'Item still has a release URN, but the link will be dead')
 
+        self._logger.info(
+                '*** Finished IA deleted item checks (took {elapsed:0.4f}s)',
+                elapsed=(pendulum.now() - start_time).total_seconds())
+
+    @property
+    def base_category(self) -> str:
+        if self._record['state'] == 'possibly_deleted':
+            return 'DeletedItem'
+        if self._record['state'] == 'merged':
+            return 'MergedItem'
+        if self._record['state'] == 'empty':
+            return 'EmptyItem'
+        return 'Item'
 
     def _simple_check(
         self, category: str, check_success: bool,
@@ -229,11 +247,11 @@ class AuditTask:
     ) -> CheckResult:
         if check_success:
             self._logger.info(f'Checking whether {pre_log_msg}… Yes')
-            return CheckPassed(self._mbid, category, additional_data)
+            return CheckPassed(self._mbid, f'{self.base_category}::{category}', additional_data)
         else:
             self._logger.info(f'Checking whether {pre_log_msg}… No')
             self._logger.error(failure_msg)
-            return CheckFailed(self._mbid, category, additional_data)
+            return CheckFailed(self._mbid, f'{self.base_category}::{category}', additional_data)
 
     async def _run_metadata_checks(
             self, ia_meta: dict[str, Any], mbstate: dict[str, Any],
@@ -251,14 +269,18 @@ class AuditTask:
                 return data
             return [data]
 
-        def get_single(key: str, default: Any = None) -> tuple[Optional[Any], CheckResult]:
-            data = metadata.get(key, default)
-            if data is None:
-                return (None, CheckFailed(self._mbid, f'Metadata::Precheck::{key} is singular', data))
+        def get_single(key: str, default: Any = None, empty_ok: bool = False) -> tuple[Optional[Any], CheckResult]:
+            sentinel = object()
+            data = metadata.get(key, sentinel)
+            if data is sentinel:
+                if empty_ok:
+                    return (default, CheckPassed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', default))
+
+                return (default, CheckFailed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
             if not isinstance(data, (str, int, bool, float)):
                 self._logger.error(f'Expected {key} to be a single value, got {data}')
-                return (None, CheckFailed(self._mbid, f'Metadata::Precheck::{key} is singular', data))
-            return (data, CheckPassed(self._mbid, f'Metadata::Precheck::{key} is singular', data))
+                return (default, CheckFailed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
+            return (data, CheckPassed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
 
         # Metadata::in caa collection
         collections = get_as_list('collection')
@@ -270,7 +292,7 @@ class AuditTask:
                 collections)
 
         # Metadata::item is noindex
-        actual_noindex, noindex_precheck = get_single('noindex', False)
+        actual_noindex, noindex_precheck = get_single('noindex', False, empty_ok=True)
         yield noindex_precheck
         yield self._simple_check(
                 'Metadata::item is noindex',
@@ -313,7 +335,7 @@ class AuditTask:
         # Metadata::date correct
         expected_date = set(mbstate['release_dates'])
         exp_date_str = str(expected_date) if expected_date else '{}'
-        actual_date, date_precheck = get_single('date')
+        actual_date, date_precheck = get_single('date', empty_ok=True)
         yield date_precheck
         yield self._simple_check(
                 'Metadata::date correct',
@@ -324,7 +346,7 @@ class AuditTask:
 
         # Metadata::language correct
         expected_language = mbstate['language_code']
-        actual_language, language_precheck = get_single('language')
+        actual_language, language_precheck = get_single('language', empty_ok=True)
         yield self._simple_check(
                 'Metadata::language correct',
                 expected_language == actual_language,
@@ -337,12 +359,14 @@ class AuditTask:
             f'urn:mb_release_id:{mbstate["release_gid"]}',
             *(f'urn:mb_artist_id:{artist["artist_gid"]}' for artist in mbstate['artists']),
             *(f'urn:asin:{asin}' for asin in mbstate['asins']),
-            f'urn:barcode:{mbstate["barcode"]}',
         }
+        if mbstate['barcode']:
+            expected_ext_ids.add(f'urn:upc:{mbstate["barcode"]}')
         # Metadata::unexpected external id
         for ext_id in external_ids:
+            id_type = ext_id.split(':')[1]
             yield self._simple_check(
-                    'Metadata::unexpected external id',
+                    f'Metadata::unexpected external id {id_type}',
                     ext_id in expected_ext_ids,
                     f'{ext_id} is an expected identifier',
                     f'{ext_id} should not be attached to this item',
@@ -350,15 +374,16 @@ class AuditTask:
 
         # Metadata::missing external id
         for ext_id in expected_ext_ids:
+            id_type = ext_id.split(':')[1]
             yield self._simple_check(
-                    'Metadata::missing external id',
+                    f'Metadata::missing external id {id_type}',
                     ext_id in external_ids,
                     f'{ext_id} is attached to this item',
                     f'{ext_id} is not attached to this item, but should be',
                     ext_id)
 
         self._logger.info(
-                '*** Finished IA metadata checks (took {elapsed:0.1f}s)',
+                '*** Finished IA metadata checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
     async def _run_files_checks(
@@ -372,16 +397,22 @@ class AuditTask:
             return next((f for f in files if f.get('name') == name), None)
 
         def has_file(name: str) -> bool:
-            return get_file(name) is None
+            return get_file(name) is not None
 
         # Files::index.json exists
+        yield self._simple_check(
+                'Files::index.json exists',
+                has_file('index.json'),
+                'index.json exists',
+                'index.json is not in item file list')
+
         # Files::mb_metadata.xml exists
-        for exp_file_name in ('index.json', 'mb_metadata.xml'):
-            yield self._simple_check(
-                    f'Files::{exp_file_name} exists',
-                    has_file(exp_file_name),
-                    f'{exp_file_name} exists',
-                    f'{exp_file_name} is not in item file list')
+        yield self._simple_check(
+                'Files::mb_metadata.xml exists',
+                has_file(f'mbid-{self._mbid}_mb_metadata.xml'),
+                'mb_metadata.xml exists',
+                'mb_metadata.xml is not in item file list')
+
 
         for image in mbstate['images']:
             cover_id = image['id']
@@ -407,8 +438,7 @@ class AuditTask:
             # Files::image id is unique
             images_with_id = [
                     f for f in files
-                    if (f.get('name', '').startswith(
-                            f'mbid-{self._mbid}-{cover_id}.')
+                    if (re.match(rf'mbid-{self._mbid}-{cover_id}\.[a-zA-Z0-9]+$', f.get('name', '')) is not None
                         and f.get('source') == 'original')]
             yield self._simple_check(
                     'Files::image id is unique',
@@ -418,7 +448,7 @@ class AuditTask:
                     images_with_id)
 
             self._logger.info(
-                '*** Finished IA files checks (took {elapsed:0.1f}s)',
+                '*** Finished IA files checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
     async def _run_index_checks(self, mbstate: dict[str, Any]) -> AsyncIterable[CheckResult]:
@@ -426,7 +456,7 @@ class AuditTask:
         self._logger.info('*** Starting CAA index.json checks')
 
         self._logger.info('Loading CAA index.json')
-        index_raw = self._ia_item.caa_index
+        index_raw = await self._ia_item.caa_index
 
         # CAAIndex::is present
         yield self._simple_check(
@@ -441,9 +471,9 @@ class AuditTask:
         self._logger.info('Attempting to parse index.json as JSON')
         try:
             index = json.loads(index_raw)
-            yield CheckPassed(self._mbid, 'CAAIndex::is well-formed')
+            yield CheckPassed(self._mbid, f'{self.base_category}::CAAIndex::is well-formed')
         except json.JSONDecodeError as exc:
-            yield CheckFailed(self._mbid, 'CAAIndex::is well-formed', exc)
+            yield CheckFailed(self._mbid, f'{self.base_category}::CAAIndex::is well-formed', exc)
             self._logger.error('index.json not well-formed!')
             self._logger.exception(exc)
             self._logger.error('Aborting rest of checks…')
@@ -484,7 +514,7 @@ class AuditTask:
             # CAAIndex::Image::missing image
             yield self._simple_check(
                     'CAAIndex::Image::missing image',
-                    len(matching_covers) > 1,
+                    len(matching_covers) >= 1,
                     f'{cover_id} exists in index.json',
                     f'{cover_id} not present in index.json')
 
@@ -520,7 +550,7 @@ class AuditTask:
             # CAAIndex::Image::edit approval status
             if isinstance(edit_cr, CheckFailed):
                 self._logger.info('Skipping edit approval status check, edit is incorrect')
-                yield CheckSkipped(self._mbid, 'CAAIndex::Image::edit approval status')
+                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::edit approval status')
             else:
                 yield self._simple_check(
                         'CAAIndex::Image::edit approval status',
@@ -550,8 +580,8 @@ class AuditTask:
             # CAAIndex::Image::back
             if isinstance(edit_cr, CheckFailed):
                 self._logger.info('Skipping front and back checks, types are incorrect')
-                yield CheckSkipped(self._mbid, 'CAAIndex::Image::front')
-                yield CheckSkipped(self._mbid, 'CAAIndex::Image::back')
+                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::front')
+                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::back')
             else:
                 yield self._simple_check(
                         'CAAIndex::Image::front',
@@ -600,7 +630,7 @@ class AuditTask:
                 index_order)
 
         self._logger.info(
-                '*** Finished CAA index.json checks (took {elapsed:0.1f}s)',
+                '*** Finished CAA index.json checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
     async def _verify_schema_rec(
@@ -613,10 +643,11 @@ class AuditTask:
 
         cr = self._simple_check(
                 f'CAAIndex::Schema::{path} is {exp_type.__name__}',
-                isinstance(schema, exp_type),
+                isinstance(index, exp_type),
                 f'{full_path} is a {exp_type.__name__}',
-                f'{full_path} is not a {exp_type.__name__}, aborting further checks along this path…',
-                index)
+                f'{full_path} is a {type(index).__name__}, not a {exp_type.__name__}, aborting further checks along this path…',
+                (index, type(index)))
+        yield cr
         if isinstance(cr, CheckFailed):
             return
 

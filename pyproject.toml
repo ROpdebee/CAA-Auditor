@@ -20,6 +20,8 @@ async-property = "^0.2.1"
 tqdm = "^4.60.0"
 mbdata = "^25.0.4"
 SQLAlchemy = "^1.4.7"
+aiofile = "^3.5.0"
+aiofiles = "^0.6.0"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.812"

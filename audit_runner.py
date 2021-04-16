@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional, TypeVar, TYPE_CHECKING
 
 import asyncio
 import json
+import os
 import sys
 from configparser import ConfigParser
 from pathlib import Path
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterable, Iterable
+    from collections.abc import AsyncIterable, AsyncIterator
 
 import loguru
 import pendulum
+import aiofiles
 from aiohttp import ClientSession, TCPConnector
 from aiopath import AsyncPath
 
@@ -21,48 +23,74 @@ from result_aggregator import ResultAggregator
 
 FANOUT_FACTOR = 3
 
+_T = TypeVar('_T')
+async def anext(ait: AsyncIterator[_T]) -> _T:
+    return await ait.__anext__()
+
+def aiter(ait: AsyncIterable[_T]) -> AsyncIterator[_T]:
+    return ait.__aiter__()
+
 def _fanout_path(root_path: Path, mbid: str) -> Path:
     return root_path.joinpath(*list(mbid[:FANOUT_FACTOR])) / mbid
+
+class LogQueue:
+    def __init__(self, path: AsyncPath) -> None:
+        self._path = path
+        self._buffer: list[str] = []
+
+    def put(self, msg: str) -> None:
+        self._buffer.append(msg)
+
+    async def flush(self) -> None:
+        async with self._path.open('a') as out_f:
+            await out_f.write(''.join(self._buffer))
+            self._buffer = []
 
 async def create_tasks(
         data_path: AsyncPath, root_path: Path, aiosession: ClientSession,
         logger: loguru.Logger
-) -> tuple[dict[str, Any], AsyncIterable[AuditTask]]:
+) -> tuple[dict[str, Any], AsyncIterable[tuple[AuditTask, LogQueue]]]:
     async with data_path.open('r') as data_f:
-        meta_line = next(data_f)
+        meta_line = await anext(aiter(data_f))
         audit_meta = json.loads(meta_line)
         if audit_meta['state'] != 'meta':
             raise ValueError('Expected first line of task list to be meta record')
         return audit_meta, _create_task_stream(
-                data_f, pendulum.from_timestamp(audit_meta['max_last_modified']),
+                data_path, pendulum.from_timestamp(audit_meta['max_last_modified']),
                 root_path, aiosession, logger)
 
 async def _create_task_stream(
-        task_f: Any, max_last_modified: pendulum.datetime.DateTime,
+        task_path: AsyncPath, max_last_modified: pendulum.datetime.DateTime,
         root_path: Path, aiosession: ClientSession, logger: loguru.Logger
-) -> AsyncIterable[AuditTask]:
-    async for data_line in task_f:
-        mb_data = json.loads(data_line)
-        task_path = _fanout_path(root_path, mb_data['id'])
-        task_logger = logger.bind(log_path=task_path / 'audit.log')
-        yield AuditTask(mb_data, max_last_modified, task_path, aiosession, task_logger)
+) -> AsyncIterable[tuple[AuditTask, LogQueue]]:
+    async with aiofiles.open(task_path, 'r') as task_f:
+        _ = await task_f.readline()  # Skip over meta line
+        while (lines := await task_f.readlines(2**26)):
+            for data_line in lines:
+                mb_data = json.loads(data_line)
+                task_path = AsyncPath(_fanout_path(root_path, mb_data['id']))
+                log_queue = LogQueue(task_path / 'audit_log')
+                task_logger = logger.bind(log_queue=log_queue)
+                yield AuditTask(mb_data, max_last_modified, task_path, aiosession, task_logger), log_queue
 
 async def queue_tasks(
-        tasks: AsyncIterable[AuditTask], task_q: asyncio.Queue[AuditTask],
+        tasks: AsyncIterable[tuple[AuditTask, LogQueue]], task_q: asyncio.Queue[tuple[AuditTask, LogQueue]],
         progress: ProgressBar,
 ) -> None:
-    async for task in tasks:
-        await task_q.put(task)
+    async for task, logqueue in tasks:
+        await task_q.put((task, logqueue))
         await progress.task_enqueued()
 
 async def task_runner(
-        task_q: asyncio.Queue[AuditTask], result_aggr: ResultAggregator,
+        task_q: asyncio.Queue[tuple[AuditTask, LogQueue]], result_aggr: ResultAggregator,
         progress: ProgressBar
 ) -> None:
     while True:
-        task = await task_q.get()
+        task, logqueue = await task_q.get()
         await progress.task_running()
-        task.run(result_aggr)
+        await task.audit_path.mkdir(exist_ok=True, parents=True)
+        await task.run(result_aggr)
+        await logqueue.flush()
         task_q.task_done()
 
 def get_ia_credentials() -> Optional[tuple[str, str]]:
@@ -74,8 +102,8 @@ def get_ia_credentials() -> Optional[tuple[str, str]]:
         return None
     return config['s3']['access'], config['s3']['secret']
 
-async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int) -> None:
-    configure_logging()
+async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int, spam: bool) -> None:
+    configure_logging(spam)
 
     ia_creds = get_ia_credentials()
     if ia_creds is None:
@@ -87,7 +115,7 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int)
     with mb_data_file_path.open('r') as f:
         num_items = sum(1 for l in f)
 
-    task_q: asyncio.Queue[AuditTask] = asyncio.Queue()
+    task_q: asyncio.Queue[tuple[AuditTask, LogQueue]] = asyncio.Queue(concurrency * 2)
 
     session = ClientSession(
             connector=TCPConnector(limit=concurrency),
@@ -115,24 +143,27 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int)
             for runner in runners:
                 runner.cancel()
 
-            aggregator.write_skipped_items_log(output_path / 'skipped_items.log')
-            aggregator.write_failed_checks_log(output_path / 'failed_checks.log')
-            aggregator.write_skipped_checks_log(output_path / 'skipped_checks.log')
-            aggregator.write_failures_csv(output_path / 'bad_items.csv')
-            table_data = aggregator.generate_table_data()
-            aggregator.write_plaintext_table(output_path / 'results_all.txt', table_data, only_failure_rows=False)
-            aggregator.write_jira_table(output_path / 'results_jira.txt', table_data)
-            aggregator.write_plaintext_table(output_path / 'results_condensed.txt', table_data)
-            print(aggregator.get_terminal_table(table_data))
+        aggregator.write_skipped_items_log(output_path / 'skipped_items.log')
+        aggregator.write_failed_checks_log(output_path / 'failed_checks.log')
+        aggregator.write_skipped_checks_log(output_path / 'skipped_checks.log')
+        aggregator.write_failures_csv(output_path / 'bad_items.csv')
+        table_data = aggregator.generate_table_data()
+        aggregator.write_plaintext_table(output_path / 'results_all.txt', table_data, only_failure_rows=False)
+        aggregator.write_jira_table(output_path / 'results_jira.txt', table_data)
+        aggregator.write_plaintext_table(output_path / 'results_condensed.txt', table_data)
+        print(aggregator.get_terminal_table(table_data))
 
 
-def configure_logging():
+def configure_logging(spam: bool):
     def task_logger_sink(msg: loguru.Message) -> None:
-        log_path = msg.record['extra']['log_path']
-        with log_path.open('w+') as f:
-            f.write(msg.record['message'])
+        log_queue = msg.record['extra']['log_queue']
+        log_queue.put(msg)
 
     loguru.logger.remove()
-    loguru.logger.configure(handlers=[
-        {'sink': task_logger_sink, 'filter': lambda msg: 'log_path' in msg['extra']},
-        {'sink': sys.stderr, 'filter': lambda msg: 'log_path' not in msg['extra']}])
+    loguru.logger.add(task_logger_sink, filter=lambda msg: 'log_queue' in msg['extra'], format='{message}')
+    if spam:
+        loguru.logger.add(sys.stderr)
+    else:
+        loguru.logger.add(sys.stderr, filter=lambda msg: 'log_queue' not in msg['extra'])
+
+    loguru.logger.add(sys.stderr, level='CRITICAL')

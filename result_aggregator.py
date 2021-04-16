@@ -3,13 +3,14 @@ from typing import Any
 import asyncio
 import csv
 
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from tabulate import tabulate
 
 from audit_result import CheckFailed, CheckPassed, CheckResult, CheckSkipped, ItemSkipped
 from progress import ProgressBar
+
 
 class ResultCollector:
 
@@ -30,6 +31,8 @@ class ResultAggregator(ResultCollector):
         super().__init__()
         self._progress = progress
 
+        self._internal_error_counter = 0
+
         self._failed_checks: list[CheckFailed] = []
         self._skipped_checks: list[CheckSkipped] = []
         self._skipped_items: list[ItemSkipped] = []
@@ -47,13 +50,20 @@ class ResultAggregator(ResultCollector):
         for result in audit_results:
             self._count_result(result)
 
+    def _flag_internal_error(self):
+        self._internal_error_counter += 1
+        if self._internal_error_counter > 10:
+            raise RuntimeError('Exceeded internal error counter, aborting.')
+
     def _count_result(self, result: CheckResult) -> None:
+        if result.category[0] == 'InternalError':
+            self._flag_internal_error()
         if isinstance(result, ItemSkipped):
             self._item_skip_counter[result.check_description] += 1
             self._skipped_items.append(result)
         else:
             self._check_counter.update(
-                (result.check_state, result.mbid, '::'.join(result.category[:i]))
+                (result.check_state, result.mbid, '::'.join(result.category[:i+1]))
                 for i in range(len(result.category)))
             if isinstance(result, CheckFailed):
                 self._failed_checks.append(result)
@@ -97,7 +107,7 @@ class ResultAggregator(ResultCollector):
         check_counter: Counter[tuple[str, str]] = Counter()
         check_counter_rels: Counter[tuple[str, str]] = Counter()
         total_checks: Counter[str] = Counter()
-        total_releases: Counter[str] = Counter()
+        total_releases: dict[str, set[str]] = defaultdict(set)
 
         all_releases: set[str] = set()
         all_failed_releases: set[str] = set()
@@ -109,7 +119,7 @@ class ResultAggregator(ResultCollector):
             check_counter[(state, check)] += count
             check_counter_rels[(state, check)] += 1
             total_checks[check] += count
-            total_releases[check] += 1
+            total_releases[check].add(mbid)
             all_releases.add(mbid)
             total_num_checks += count
             if state == 'FAILED':
@@ -119,51 +129,61 @@ class ResultAggregator(ResultCollector):
                 total_num_skipped += count
                 all_skipped_releases.add(mbid)
 
-        header = (
+        header = [
                 '',
-                '#checks', '#checked releases',
-                '#failed', '#failed releases', '%failed', '%failed releases',
-                '#skipped', '#skipped releases', '%skipped', '%skipped releases')
-        reason_rows: list[tuple[str, int, int, int, int, float, float, int, int, float, float]] = []
+                '#checks', '#checked rels',
+                '#failed', '#failed rels',
+                '#skipped', '#skipped rels']
+
+        def c(count: int, total: int) -> str:
+            return f'{count} ({count / total :.2%})'
+
+        reason_rows: list[list[Any]] = []
         for reason in sorted(total_checks.keys()):
             num_checked = total_checks[reason]
-            num_releases = total_releases[reason]
+            num_releases = len(total_releases[reason])
             num_failed = check_counter[('FAILED', reason)]
-            num_failed_rels = check_counter[('FAILED', reason)]
+            num_failed_rels = check_counter_rels[('FAILED', reason)]
             num_skipped = check_counter[('SKIPPED', reason)]
-            num_skipped_rels = check_counter[('SKIPPED', reason)]
+            num_skipped_rels = check_counter_rels[('SKIPPED', reason)]
 
-            reason_rows.append((
+            reason_rows.append([
                 reason, num_checked, num_releases,
-                num_failed, num_failed_rels, num_failed / num_checked, num_failed_rels / num_releases,
-                num_skipped, num_skipped_rels, num_skipped / num_checked, num_skipped_rels / num_releases))
+                c(num_failed, num_checked),
+                c(num_failed_rels, num_checked),
+                c(num_skipped, num_checked),
+                c(num_skipped_rels, num_releases),
+            ])
 
-        item_skip_rows: list[tuple[Any, ...]] = [
-            tuple(['SKIPPED ITEMS'] + [''] * 10)]
+
+        item_skip_rows: list[Any] = [
+            ['SKIPPED ITEMS'] + [''] * 6]
         for skip_reason, skip_count in sorted(self._item_skip_counter.items()):
-            item_skip_rows.append(tuple([skip_reason] + [''] * 6 + [str(skip_count)] + [''] * 3))
+            item_skip_rows.append(['  ' + skip_reason, None, None, None, None, skip_count, None])
 
-        total_row = (
+        total_row = [
                 'TOTAL', total_num_checks, len(all_releases),
-                total_num_failed, len(all_failed_releases),
-                total_num_failed / total_num_checks,
-                len(all_failed_releases) / len(all_releases),
-                total_num_skipped, len(all_skipped_releases),
-                total_num_skipped / total_num_checks,
-                len(all_skipped_releases) / len(all_releases))
+                c(total_num_failed, total_num_checks),
+                c(len(all_failed_releases), len(all_releases)),
+                c(total_num_skipped, total_num_checks),
+                c(len(all_skipped_releases), len(all_releases)),
+        ]
 
         return (header, reason_rows, item_skip_rows, total_row)
 
     def _filter_failure_rows(self, data: Any) -> Any:
         header, check_rows, item_skip_rows, total_row = data
-        check_rows = [row for row in check_rows if row[3]]
+        check_rows = [row for row in check_rows if int(row[3].split(' ')[0])]
         return (header, check_rows, item_skip_rows, total_row)
 
     def _write_table(self, out: Path, data: Any, /, only_failure_rows: bool, tablefmt: str) -> None:
         if only_failure_rows:
             data = self._filter_failure_rows(data)
 
-        table_str = tabulate(data, headers='firstrow', tablefmt=tablefmt, floatfmt='.2f')
+        header, check_rows, item_skip_rows, total_row = data
+        table = [header, *check_rows, *item_skip_rows, total_row]
+
+        table_str = tabulate(table, headers='firstrow', tablefmt=tablefmt, floatfmt='.2f')
 
         out.write_text(table_str)
 
@@ -177,4 +197,7 @@ class ResultAggregator(ResultCollector):
         if only_failure_rows:
             data = self._filter_failure_rows(data)
 
-        return tabulate(data, headers='firstrow', tablefmt='fancy_grid', floatfmt='.2f')
+        header, check_rows, item_skip_rows, total_row = data
+        table = [header, *check_rows, *item_skip_rows, total_row]
+
+        return tabulate(table, headers='firstrow', tablefmt='fancy_grid', floatfmt='.2f')

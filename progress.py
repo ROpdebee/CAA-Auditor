@@ -16,13 +16,13 @@ class ProgressBar:
 
     def __init__(self, total: int) -> None:
         self.mgr = enlighten.Manager()
-        self.queued = self.mgr.counter(
-                total=total, desc='Auditing', unit='tasks', color='white',
+        self.pending = self.mgr.counter(
+                total=total, desc='Auditing', unit='tasks', color='gray',
                 bar_format=self.bar_format)
-        self.pending = self.queued.add_subcounter('gray')
-        self.success = self.queued.add_subcounter('green')
-        self.skipped = self.queued.add_subcounter('orange')
-        self.failed = self.queued.add_subcounter('red')
+        self.success = self.pending.add_subcounter('green')
+        self.skipped = self.pending.add_subcounter('orange')
+        self.failed = self.pending.add_subcounter('red')
+        self.queued = 0
 
         self.status = self.mgr.status_bar(
                 status_format=self.status_format,
@@ -42,22 +42,23 @@ class ProgressBar:
 
     def _update_statusbar(self) -> None:
         self.status.update(
-            queued=self.queued.count,
+            queued=self.queued,
             success=self.success.count,
-            pending=self.pending.count,
+            pending=self.pending.count - self.pending.subcount,
             skipped=self.skipped.count,
             failed=self.failed.count,
             finished=self.success.count + self.skipped.count + self.failed.count,
-            todo=self.queued.total - self.queued.subcount)
+            todo=self.pending.total - self.pending.count)
 
     async def task_enqueued(self) -> None:
         async with self._lock:
-            self.queued.update()
+            self.queued += 1
             self._update_statusbar()
 
     async def task_running(self) -> None:
         async with self._lock:
-            self.pending.update_from(self.queued)
+            self.pending.update()
+            self.queued -= 1
             self._update_statusbar()
 
     async def task_success(self) -> None:
