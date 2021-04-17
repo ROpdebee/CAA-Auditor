@@ -22,6 +22,9 @@ mbdata = "^25.0.4"
 SQLAlchemy = "^1.4.7"
 aiofile = "^3.5.0"
 aiofiles = "^0.6.0"
+cchardet = "^2.1.7"
+brotlipy = "^0.7.0"
+cysimdjson = "^21.4a4"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.812"

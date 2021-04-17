@@ -106,13 +106,13 @@ class IAItem:
         return index_content
 
     @backoff.on_exception(
-            backoff.expo, (aiohttp.ClientError, IAException), max_tries=10,
+            backoff.expo, (aiohttp.ClientError, IAException), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def has_pending_tasks(self) -> bool:
         async with self._session.get('https://archive.org/services/tasks.php', params={
                 'summary': 1,
                 'identifier': self._identifier}) as resp:
-            summary = await resp.json()
+            summary = await resp.json(encoding='utf-8')
             if not summary['success']:
                 raise IAException(summary.get('error'))
             return any(v != 0 for v in summary['value']['summary'].values())
@@ -132,7 +132,7 @@ class IAItem:
             return None
 
     @backoff.on_exception(
-            backoff.expo, (aiohttp.ClientError, IAException), max_tries=10,
+            backoff.expo, (aiohttp.ClientError, IAException), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _fetch_metadata(self) -> dict[str, Any]:
         """Fetch the metadata of the item.
@@ -143,7 +143,7 @@ class IAItem:
         self._logger.info(f'Loading {url}')
         async with self._session.get(url) as resp:
             resp.raise_for_status()
-            metadata = await resp.json()
+            metadata = await resp.json(encoding='utf-8')
 
             if metadata and 'error' in metadata:
                 raise IAException(metadata['error'])
@@ -157,7 +157,7 @@ class IAItem:
             return metadata
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=10,
+            backoff.expo, aiohttp.ClientError, max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _fetch_index(self) -> Optional[str]:
         """Fetch the index.json of the item.
@@ -174,10 +174,15 @@ class IAItem:
             # Any other error should be retried or eventually skip the item
             resp.raise_for_status()
 
-            return await resp.text()
+            bcontent = await resp.read()
+            try:
+                return bcontent.decode()
+            except UnicodeDecodeError as exc:
+                self._logger.critical(f'Decoding error, {exc} on {bcontent!r}')
+                return bcontent.decode(errors='ignore')
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=10,
+            backoff.expo, aiohttp.ClientError, max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _is_404(self) -> bool:
         self._logger.info(f'Checking whether {self._identifier} is 404')
