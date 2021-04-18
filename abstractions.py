@@ -31,9 +31,10 @@ class IAState:
     last_modified: DateTime
 
     def __init__(self, d: JSONObject) -> None:
-        self.files = IAFiles(safe_get(d, 'files', []))
-        self.meta = IAMeta(safe_get(d, 'metadata', {}))
         self.is_dark = safe_get(d, 'is_dark', False)
+        if not self.is_dark:
+            self.files = IAFiles(safe_get(d, 'files', []))
+            self.meta = IAMeta(safe_get(d, 'metadata', {}))
         self.last_modified = pendulum.from_timestamp(safe_get(d, 'item_last_updated', 0))
 
 class IAFile:

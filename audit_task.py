@@ -165,7 +165,6 @@ class AuditTask:
         return (iaf.name not in ('__ia_thumb.jpg', f'mbid-{self._mbid}_files.xml')
                 and iaf.last_modified > self._max_last_modified)
 
-
     async def _run(self) -> None:
         self._logger.info('Retrieving IA item metadata…')
         with self._stage(CheckStage.fetch):
@@ -193,7 +192,7 @@ class AuditTask:
 
         if not self._check(
                 'ia modified',
-                ia_state.last_modified < self._max_last_modified or ia_state.files.has_any_original(self._original_recently_modified),
+                ia_state.last_modified < self._max_last_modified or not ia_state.files.has_any_original(self._original_recently_modified),
                 ''.join((
                     'Cannot audit this item since it was modified on ',
                     ia_state.last_modified.to_rfc1123_string(),
