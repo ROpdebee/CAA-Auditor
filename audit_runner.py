@@ -140,7 +140,7 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int,
         with ProgressBar(num_items) as progress:
             queuer = asyncio.create_task(queue_tasks(task_stream, task_q, progress))
 
-            aggregator = ResultAggregator(progress)
+            aggregator = ResultAggregator(output_path, progress)
             runners = [
                     asyncio.create_task(task_runner(task_q, aggregator, progress))
                     for _ in range(concurrency)]

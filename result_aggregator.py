@@ -1,16 +1,26 @@
-from typing import Any, NamedTuple
+from __future__ import annotations
+
+from typing import Any, NamedTuple, TYPE_CHECKING
 
 import asyncio
 import csv
+import os
 
 from collections import Counter, defaultdict
-from functools import singledispatchmethod
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from tabulate import tabulate
 
 from audit_result import CheckFailed, CheckPassed, CheckResult, ItemSkipped
 from progress import ProgressBar
+
+class ResultType(NamedTuple):
+    mbid: str
+    check_description: str
+    check_state: str
 
 class RowType(NamedTuple):
     name: str
@@ -39,25 +49,16 @@ class ReasonCounter:
         self._failed_rels: set[str] = set()
         self._all_rels: set[str] = set()
 
-    @singledispatchmethod
-    def add(self, cr: CheckResult) -> None:
-        raise NotImplementedError()
-
-    @add.register
-    def _(self, cr: CheckFailed) -> None:
-        self._num_failed += 1
-        self._failed_rels.add(cr.mbid)
+    def add(self, cr: ResultType) -> None:
         self._all_rels.add(cr.mbid)
-
-    @add.register  # type: ignore[no-redef]
-    def _(self, cr: CheckPassed) -> None:
-        self._num_passed += 1
-        self._all_rels.add(cr.mbid)
-
-    @add.register  # type: ignore[no-redef]
-    def _(self, cr: ItemSkipped) -> None:
-        self._num_skipped += 1
-        self._all_rels.add(cr.mbid)
+        if cr.check_state == 'FAILED':
+            self._num_failed += 1
+            self._failed_rels.add(cr.mbid)
+        elif cr.check_state == 'ITEM SKIPPED':
+            self._num_skipped += 1
+        else:
+            assert cr.check_state == 'PASSED'
+            self._num_passed += 1
 
     @property
     def num_checks(self) -> int:
@@ -82,12 +83,17 @@ class ReasonCounter:
 class ResultAggregator(ResultCollector):
     """Aggregator for results provided by the tasks."""
 
-    def __init__(self, progress: ProgressBar) -> None:
+    def __init__(self, root_path: Path, progress: ProgressBar) -> None:
         super().__init__()
         self._progress = progress
 
         self._internal_error_counter = 0
-        self._results: list[CheckResult] = []
+
+        # Ideally should be closed at some point. Used to store intermediate
+        # results since there's a chance they won't all fit in memory at the
+        # same time.
+        root_path.mkdir(exist_ok=True, parents=True)
+        self._cache_file = (root_path / 'results_cache').open('w+')
 
     def put(self, audit_results: list[CheckResult]) -> None:
         skipped = failed = False
@@ -101,7 +107,10 @@ class ResultAggregator(ResultCollector):
             elif isinstance(res, CheckFailed):
                 failed = True
 
-            self._results.append(res)
+            self._cache_file.write('\t'.join([
+                    res.mbid, res.check_description, res.check_state]) + os.linesep)
+
+        self._cache_file.flush()
 
         if skipped:
             self._progress.task_skipped()
@@ -115,24 +124,34 @@ class ResultAggregator(ResultCollector):
         if self._internal_error_counter > 10:
             raise RuntimeError('Exceeded internal error counter, aborting.')
 
+    def _iter_results(self) -> Iterable[ResultType]:
+        """Make sure to fully consume the results OR seek back to the end of the file manually!"""
+        self._cache_file.seek(0)
+        return (ResultType(*line.strip().split('\t')) for line in self._cache_file)
+
     def write_skipped_items_log(self, path: Path) -> None:
-        skipped_items = [cr for cr in self._results if isinstance(cr, ItemSkipped)]
-        path.write_text('\n'.join(map(str, skipped_items)))
+        with path.open('w') as out_f:
+            for cr in self._iter_results():
+                if cr.check_state == 'ITEM SKIPPED':
+                    out_f.write(str(cr) + os.linesep)
 
     def write_failed_checks_log(self, path: Path) -> None:
-        failed_checks = [cr for cr in self._results if isinstance(cr, CheckFailed)]
-        path.write_text('\n'.join(map(str, failed_checks)))
+        with path.open('w') as out_f:
+            for cr in self._iter_results():
+                if cr.check_state == 'FAILED':
+                    out_f.write(str(cr) + os.linesep)
 
     def write_failures_csv(self, path: Path) -> None:
-        failed_checks = [cr for cr in self._results if isinstance(cr, CheckFailed)]
         fail_reasons: set[str] = set()
         failed_mbids: set[str] = set()
         failure_counter: Counter[tuple[str, str]] = Counter()
 
-        for failure in failed_checks:
-            fail_reasons.add(failure.check_description)
-            failed_mbids.add(failure.mbid)
-            failure_counter[(failure.mbid, failure.check_description)] += 1
+        for cr in self._iter_results():
+            if cr.check_state != 'FAILED':
+                continue
+            fail_reasons.add(cr.check_description)
+            failed_mbids.add(cr.mbid)
+            failure_counter[(cr.mbid, cr.check_description)] += 1
 
         fail_reasons_ordered = sorted(fail_reasons)
         header = ['mbid'] + fail_reasons_ordered
@@ -153,7 +172,7 @@ class ResultAggregator(ResultCollector):
         all_failed_releases: set[str] = set()
         check_counter: dict[str, ReasonCounter] = defaultdict(ReasonCounter)
 
-        for cr in self._results:
+        for cr in self._iter_results():
             check_counter[cr.check_description].add(cr)
             all_releases.add(cr.mbid)
             if cr.check_state == 'FAILED':
