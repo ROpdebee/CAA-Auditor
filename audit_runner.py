@@ -5,6 +5,7 @@ from typing import Any, Optional, TypeVar, TYPE_CHECKING
 import asyncio
 import json
 import os
+import random
 import sys
 from configparser import ConfigParser
 from pathlib import Path
@@ -17,6 +18,10 @@ import aiofiles
 from aiohttp import ClientSession, TCPConnector
 from aiopath import AsyncPath
 
+if TYPE_CHECKING:
+    from pendulum.datetime import DateTime
+
+from abstractions import CheckStage
 from audit_task import AuditTask
 from progress import ProgressBar
 from result_aggregator import ResultAggregator
@@ -60,7 +65,7 @@ async def create_tasks(
                 root_path, aiosession, logger)
 
 async def _create_task_stream(
-        task_path: AsyncPath, max_last_modified: pendulum.datetime.DateTime,
+        task_path: AsyncPath, max_last_modified: DateTime,
         root_path: Path, aiosession: ClientSession, logger: loguru.Logger
 ) -> AsyncIterable[tuple[AuditTask, LogQueue]]:
     async with aiofiles.open(task_path, 'r') as task_f:
@@ -71,26 +76,35 @@ async def _create_task_stream(
                 task_path = AsyncPath(_fanout_path(root_path, mb_data['id']))
                 log_queue = LogQueue(task_path / 'audit_log')
                 task_logger = logger.bind(log_queue=log_queue)
-                yield AuditTask(mb_data, max_last_modified, task_path, aiosession, task_logger), log_queue
+                yield AuditTask(
+                        mb_data, max_last_modified, task_path, aiosession,
+                        task_logger, ), log_queue
 
 async def queue_tasks(
         tasks: AsyncIterable[tuple[AuditTask, LogQueue]], task_q: asyncio.Queue[tuple[AuditTask, LogQueue]],
         progress: ProgressBar,
 ) -> None:
     async for task, logqueue in tasks:
+        task.set_start_stage_cb(progress.enter_stage)
+        task.set_finish_stage_cb(progress.exit_stage)
         await task_q.put((task, logqueue))
-        await progress.task_enqueued()
+        progress.task_enqueued()
 
 async def task_runner(
         task_q: asyncio.Queue[tuple[AuditTask, LogQueue]], result_aggr: ResultAggregator,
         progress: ProgressBar
 ) -> None:
+    await asyncio.sleep(random.random())  # Random jitter at the start so that not all requests get fired immediately
     while True:
         task, logqueue = await task_q.get()
-        await progress.task_running()
+        progress.task_running()
+        progress.enter_stage(CheckStage.preprocess)
         await task.audit_path.mkdir(exist_ok=True, parents=True)
+        progress.exit_stage(CheckStage.preprocess)
         await task.run(result_aggr)
+        progress.enter_stage(CheckStage.postprocess)
         await logqueue.flush()
+        progress.exit_stage(CheckStage.postprocess)
         task_q.task_done()
 
 def get_ia_credentials() -> Optional[tuple[str, str]]:
@@ -145,7 +159,6 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int,
 
         aggregator.write_skipped_items_log(output_path / 'skipped_items.log')
         aggregator.write_failed_checks_log(output_path / 'failed_checks.log')
-        aggregator.write_skipped_checks_log(output_path / 'skipped_checks.log')
         aggregator.write_failures_csv(output_path / 'bad_items.csv')
         table_data = aggregator.generate_table_data()
         aggregator.write_plaintext_table(output_path / 'results_all.txt', table_data, only_failure_rows=False)

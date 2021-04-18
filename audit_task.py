@@ -5,10 +5,13 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 import json
 import re
 import textwrap
+from collections import Counter, defaultdict
+from contextlib import contextmanager
+from functools import cached_property
 from pathlib import Path
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterable
+    from collections.abc import Generator, AsyncIterable
 
 import pendulum
 from aiohttp import ClientSession
@@ -16,17 +19,22 @@ from aiopath import AsyncPath
 
 if TYPE_CHECKING:
     from loguru import Logger
+    from pendulum.datetime import DateTime
 
-from audit_result import CheckFailed, CheckPassed, CheckResult, CheckSkipped, ItemSkipped
+from audit_result import CheckFailed, CheckPassed, CheckResult, ItemSkipped
 from ia_item import IAItem
-from index_schema import INDEX_SCHEMA
 from result_aggregator import ResultCollector
+from abstractions import CAAIndex, CheckStage, IAFile, IAFiles, IAMeta, IAState, MBImage, MBState
+
 
 class AuditTask:
+
+    _start_stage_cbs: list[Callable[[CheckStage], None]]
+    _finish_stage_cbs: list[Callable[[CheckStage], None]]
+
     def __init__(
-            self, task_record: dict[str, Any],
-            max_last_modified: pendulum.datetime.DateTime,
-            audit_path: Path, session: ClientSession, logger: Logger
+            self, task_record: dict[str, Any], max_last_modified: DateTime,
+            audit_path: Path, session: ClientSession, logger: Logger,
     ) -> None:
         self._record = task_record
         self._mbid = task_record['id']
@@ -35,20 +43,44 @@ class AuditTask:
         self._logger = logger
         self._ia_item = IAItem(f'mbid-{self._mbid}', audit_path, session, logger)
 
+        self._results: list[CheckResult] = []
+        self._start_stage_cbs = []
+        self._finish_stage_cbs = []
+
+    def set_start_stage_cb(
+            self, cb: Callable[[CheckStage], None],
+    ) -> None:
+        self._start_stage_cbs.append(cb)
+
+    def set_finish_stage_cb(
+            self, cb: Callable[[CheckStage], None],
+    ) -> None:
+        self._finish_stage_cbs.append(cb)
+
+    @contextmanager
+    def _stage(self, stage: CheckStage) -> Generator[None, None, None]:
+        for cb in self._start_stage_cbs:
+            cb(stage)
+        try:
+            yield
+        finally:
+            for cb in self._finish_stage_cbs:
+                cb(stage)
+
     async def run(self, aggregator: ResultCollector) -> None:
         start_time = pendulum.now()
         self._logger.info(
                 f'STARTING AUDIT TASK FOR {self._mbid} AT {start_time.to_rfc1123_string()}')
-        results: list[CheckResult]
         had_exception = False
         try:
-            results = [res async for res in self._run()]
+            await self._run()
         except Exception as exc:
             had_exception = True
             self._logger.opt(exception=True).critical(f'Internal error')
-            results = [ItemSkipped(self._mbid, f'InternalError::{exc.__class__.__name__}', exc)]
+            self._results.append(ItemSkipped(self._mbid, f'InternalError::{exc.__class__.__name__}', exc))
 
-        await self._report_results(results, aggregator)
+        with self._stage(CheckStage.report):
+            await self._report_results(aggregator)
 
         if had_exception:
             status_text = 'FAILED'
@@ -62,640 +94,412 @@ class AuditTask:
                 elapsed=(end_time - start_time).total_seconds())
 
     async def _report_results(
-            self, results: list[CheckResult], aggregator: ResultCollector
+            self, aggregator: ResultCollector
     ) -> None:
-        await (self.audit_path / 'failures.log').write_text('\n'.join(
-                str(res) for res in results if isinstance(res, CheckFailed)))
-        async with aggregator.lock:
-            await aggregator.put(results)
+        failed: list[CheckFailed] = []
+        num_failed = num_skipped = num_passed = 0
 
-        num_failed = len([res for res in results if isinstance(res, CheckFailed)])
-        num_skipped = len([res for res in results if isinstance(res, ItemSkipped)])
-        num_success = len([res for res in results if isinstance(res, CheckPassed)])
+        for res in self._results:
+            if isinstance(res, CheckFailed):
+                num_failed += 1
+                failed.append(res)
+            elif isinstance(res, CheckPassed):
+                num_passed += 1
+            elif isinstance(res, ItemSkipped):
+                num_skipped += 1
+            else:
+                assert False
 
-        if num_success == len(results):
-            self._logger.info(f'All {num_success} checks passed.')
+        await (self.audit_path / 'failures.log').write_text('\n'.join(map(str, failed)))
+
+        aggregator.put(self._results)
+
+        if num_passed == len(self._results):
+            self._logger.info(f'All {num_passed} checks passed.')
         else:
-            self._logger.info(f'{num_success} successful checks, {num_failed} failed checks, {num_skipped} skipped checks.')
+            self._logger.info(f'{num_passed} successful checks, {num_failed} failed checks, {num_skipped} skipped checks.')
             self._logger.info('Summary:')
-            max_desc_length = max(len(res.check_description) for res in results)
-            for check_result in results:
+            max_desc_length = max(len(res.check_description) for res in self._results)
+            for check_result in self._results:
                 self._logger.info(check_result.check_description.ljust(max_desc_length) + ' … ' + check_result.check_state)
                 if isinstance(check_result, CheckFailed) and check_result.additional_data is not None:
                     self._logger.info('    Additional failure data:')
                     self._logger.info(textwrap.indent(str(check_result.additional_data), ' ' * 4))
 
-    async def _run(self) -> AsyncIterable[CheckResult]:
-        self._logger.info('Retrieving IA item metadata…')
-        ia_meta = await self._ia_item.metadata
+    @cached_property
+    def base_category(self) -> str:
+        return {
+            'possibly_deleted': 'DeletedItem',
+            'merged': 'MergedItem',
+            'empty': 'EmptyItem',
+            'active': 'Item'
+        }[self._record['state']]
 
-        if not ia_meta:
-            # 404, BAD!
-            self._logger.error('Received empty metadata, item does not exist! Aborting…')
-            yield CheckFailed(self._mbid, f'{self.base_category}::exists')
+    def _pass(self, category: str) -> None:
+        self._results.append(CheckPassed(self._mbid, f'{self.base_category}::{category}'))
+
+    def _fail(self, category: str) -> None:
+        self._results.append(CheckFailed(self._mbid, f'{self.base_category}::{category}'))
+
+    def _item_skip(self, category: str) -> None:
+        self._results.append(ItemSkipped(self._mbid, f'{self.base_category}::{category}'))
+
+    def _check(
+        self, category: str, check_success: bool,
+        failure_msg: str, fail_reporter: Optional[Callable[[str], None]] = None
+    ) -> bool:
+        reporter: Callable[[str], None]
+        if check_success:
+            reporter = self._pass
+        else:
+            if fail_reporter is None:
+                reporter = self._fail
+            else:
+                reporter = fail_reporter
+            self._logger.error(failure_msg)
+
+        reporter(category)
+
+        return check_success
+
+    def _original_recently_modified(self, iaf: IAFile) -> bool:
+        return (iaf.name not in ('__ia_thumb.jpg', f'mbid-{self._mbid}_files.xml')
+                and iaf.last_modified > self._max_last_modified)
+
+
+    async def _run(self) -> None:
+        self._logger.info('Retrieving IA item metadata…')
+        with self._stage(CheckStage.fetch):
+            ia_state_raw = await self._ia_item.metadata
+
+        if not self._check(
+                'exists', bool(ia_state_raw),
+                'Received empty metadata, item does not exist! Aborting…'):
             return
 
-        self._logger.info('Metadata fetched')
-        yield CheckPassed(self._mbid, f'{self.base_category}::exists')
+        ia_state = IAState(ia_state_raw)
 
         self._logger.info('Checking whether there are any pending catalog tasks…')
-        if await self._ia_item.has_pending_tasks():
-            self._logger.info('Item has pending tasks and may get modified later. Aborting…')
-            yield ItemSkipped(self._mbid, f'{self.base_category}::has pending tasks')
+        if not self._check(
+                'has pending tasks', not await self._ia_item.has_pending_tasks(),
+                'Item has pending tasks and may get modified later. Aborting…',
+                self._item_skip):
             return
 
-        self._logger.info('No pending tasks, continuing with audit')
-
-        self._logger.info('Checking whether item is dark…')
-        if ia_meta.get('is_dark', False):
-            self._logger.info('Cannot audit this item since it is darkened. Aborting…')
-            yield ItemSkipped(self._mbid, f'{self.base_category}::darkened')
+        if not self._check(
+                'darkened', not ia_state.is_dark,
+                'Cannot audit this item since it is darkened. Aborting…',
+                self._item_skip):
             return
 
-        self._logger.info('Item is accessible!')
-
-        ia_last_modified = pendulum.from_timestamp(ia_meta['item_last_updated'])
-
-        if ia_last_modified >= self._max_last_modified:
-            self._logger.info(''.join([
+        if not self._check(
+                'ia modified',
+                ia_state.last_modified < self._max_last_modified or ia_state.files.has_any_original(self._original_recently_modified),
+                ''.join((
                     'Cannot audit this item since it was modified on ',
-                    ia_last_modified.to_rfc1123_string(),
+                    ia_state.last_modified.to_rfc1123_string(),
                     ', which is after the DB state as of ',
                     self._max_last_modified.to_rfc1123_string(),
-                    '. Aborting…']))
-            yield ItemSkipped(self._mbid, f'{self.base_category}::ia modified')
-            return
-
-        self._logger.info('IA item has not recently been modified.')
-
-        if 'metadata' not in ia_meta:
-            self._logger.error('Item missing IA metadata. Aborting…')
-            yield CheckFailed(self._mbid, f'{self.base_category}::Metadata::missing metadata key')
+                    '. Aborting…')),
+                self._item_skip):
             return
 
         if self._record['state'] in ('active', 'empty'):
-            async for cr in self._run_active_checks(ia_meta):
-                yield cr
+            await self._run_active_checks(ia_state)
+        elif self._record['state'] in ('possibly_deleted', 'merged'):
+            with self._stage(CheckStage.meta):
+                self._run_deleted_checks(ia_state)
 
-        if self._record['state'] in ('possibly_deleted', 'merged'):
-            async for cr in self._run_deleted_checks(ia_meta):
-                yield cr
+    async def _run_active_checks(self, ia_state: IAState) -> None:
+        mb_state = MBState(self._record['data'])
+        with self._stage(CheckStage.fetch):
+            self._logger.info('Loading index.json')
+            index_raw = await self._ia_item.caa_index
 
-    async def _run_active_checks(self, ia_meta: dict[str, Any]) -> AsyncIterable[CheckResult]:
-        mbstate = self._record['data']
+        with self._stage(CheckStage.meta):
+            self._run_metadata_checks(ia_state.meta, mb_state)
 
-        self._logger.info('')
+        with self._stage(CheckStage.files):
+            self._run_files_checks(ia_state.files, mb_state)
 
-        async for metadata_check_result in self._run_metadata_checks(ia_meta, mbstate):
-            yield metadata_check_result
+        with self._stage(CheckStage.index):
+            self._run_index_checks(index_raw, mb_state)
 
-        self._logger.info('')
-
-        async for files_check_result in self._run_files_checks(ia_meta, mbstate):
-            yield files_check_result
-
-        self._logger.info('')
-
-        async for index_check_result in self._run_index_checks(mbstate):
-            yield index_check_result
-
-    async def _run_deleted_checks(self, ia_meta: dict[str, Any]) -> AsyncIterable[CheckResult]:
+    def _run_deleted_checks(self, ia_state: IAState) -> None:
         start_time = pendulum.now()
         self._logger.info('*** Starting IA deleted item checks')
 
-        files = ia_meta.get('files', [])
-
-        def has_any_file(pred: Callable[[dict[str, Any]], bool]) -> bool:
-            return next((f for f in files if pred(f)), None) is not None
+        files = ia_state.files
 
         # Skip this check if the item never contained an index.json and is a
         # possibly_deleted item, it was probably uploaded from test.
-        # DeletedItem::test item
-        if self._record['state'] == 'possibly_deleted':
-            self._logger.info('Checking whether this item is a main MB item')
-            has_index = has_any_file(
-                    lambda f: (
-                        (name := f.get('name', '')) == 'index.json'
-                        or name.startswith('history/files/index.json')))
-            if not has_index:
-                self._logger.info('Possibly deleted item does not contain and never has contained index.json. Likely from test, aborting…')
-                yield ItemSkipped(self._mbid, f'{self.base_category}::test item')
-                return
+        if not self._check(
+                'test item', files.has_original('index.json') or files.has_historical('index.json'),
+                'Possibly deleted item does not contain and never has contained index.json. Likely from test, aborting…',
+                self._item_skip):
+            return
 
-            self._logger.info('Item has/had an index, continuing.')
-
-        # DeletedItem::index is absent
-        yield self._simple_check(
-                'index is absent',
-                not has_any_file(lambda f: f.get('name') == 'index.json'),
-                'index.json file was removed',
+        self._check(
+                'index is absent', not files.has_original('index.json'),
                 'Item still has an index.json file which has not been removed')
 
-        # DeletedItem::images are absent
-        yield self._simple_check(
+        self._check(
                 'images are absent',
-                not has_any_file(lambda f:
-                    (f.get('name', '').split('.')[-1] in ('png', 'jpg', 'gif', 'pdf')
-                        and f.get('name', '').startswith(f'mbid-{self._mbid}-')
-                        and f.get('source', '') == 'original')),
-                'original images were removed',
+                not files.has_any_original(lambda iaf: iaf.name.split('.')[-1] in ('png', 'jpg', 'gif', 'pdf') and iaf.name.startswith(f'mbid-{self._mbid}-')),
                 'Item still has an original image which has not been removed')
 
-        # DeletedItem::derivatives are absent
-        yield self._simple_check(
+        self._check(
                 'derivatives are absent',
-                not has_any_file(lambda f:
-                    (f.get('source', '') == 'derivative'
-                        and f.get('name', '').startswith(f'mbid-{self._mbid}-'))),
-                'derived files were removed',
-                'Item still has a derived file which has not been removed, but its original has been')
+                not files.has_any_derivative(lambda name: name.startswith(f'mbid-{self._mbid}-')),
+                'Item still has a derived file which has not been removed')
 
-        # DeletedItem::mb_metadata is absent
-        yield self._simple_check(
-                'mb_metadata is absent',
-                not has_any_file(lambda f: f.get('name') == f'mbid-{self._mbid}_mb_metadata.xml'),
-                'mb_metadata.xml file was removed',
+        self._check(
+                'mb_metadata is absent', not files.has_original(f'mbid-{self._mbid}_mb_metadata.xml'),
                 'Item still has an mb_metadata.xml file which has not been removed')
 
         if self._record['state'] == 'possibly_deleted':
             # Only check this for deleted items, for merged ones, it still redirects
-            # DeletedItem::release url is absent
-            yield self._simple_check(
+            self._check(
                     'release url is absent',
-                    # Below should also work if it's a singleton string instead of a list
-                    f'urn:mb_release_id:{self._mbid}' not in ia_meta.get('metadata', {}).get('external-identifier', []),
-                    'release URN is removed from item',
+                    f'urn:mb_release_id:{self._mbid}' not in ia_state.meta.external_ids,
                     'Item still has a release URN, but the link will be dead')
 
         self._logger.info(
                 '*** Finished IA deleted item checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
-    @property
-    def base_category(self) -> str:
-        if self._record['state'] == 'possibly_deleted':
-            return 'DeletedItem'
-        if self._record['state'] == 'merged':
-            return 'MergedItem'
-        if self._record['state'] == 'empty':
-            return 'EmptyItem'
-        return 'Item'
-
-    def _simple_check(
-        self, category: str, check_success: bool,
-        pre_log_msg: str, failure_msg: str, additional_data: Optional[Any] = None,
-    ) -> CheckResult:
-        if check_success:
-            self._logger.info(f'Checking whether {pre_log_msg}… Yes')
-            return CheckPassed(self._mbid, f'{self.base_category}::{category}', additional_data)
-        else:
-            self._logger.info(f'Checking whether {pre_log_msg}… No')
-            self._logger.error(failure_msg)
-            return CheckFailed(self._mbid, f'{self.base_category}::{category}', additional_data)
-
-    async def _run_metadata_checks(
-            self, ia_meta: dict[str, Any], mbstate: dict[str, Any],
-    ) -> AsyncIterable[CheckResult]:
+    def _run_metadata_checks(self, ia_meta: IAMeta, mb_state: MBState) -> None:
         start_time = pendulum.now()
         self._logger.info('*** Starting IA metadata checks')
 
-        metadata = ia_meta['metadata']
-
-        def get_as_list(key: str) -> list[Any]:
-            data = metadata.get(key)
-            if data is None:
-                return []
-            if isinstance(data, list):
-                return data
-            return [data]
-
-        def get_single(key: str, default: Any = None, empty_ok: bool = False) -> tuple[Optional[Any], CheckResult]:
-            sentinel = object()
-            data = metadata.get(key, sentinel)
-            if data is sentinel:
-                if empty_ok:
-                    return (default, CheckPassed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', default))
-
-                return (default, CheckFailed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
-            if not isinstance(data, (str, int, bool, float)):
-                self._logger.error(f'Expected {key} to be a single value, got {data}')
-                return (default, CheckFailed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
-            return (data, CheckPassed(self._mbid, f'{self.base_category}::Metadata::Precheck::{key} is singular', data))
-
         # Metadata::in caa collection
-        collections = get_as_list('collection')
-        yield self._simple_check(
+        self._check(
                 'Metadata::in caa collection',
-                'coverartarchive' in collections,
-                '`coverartarchive` is present in `metadata.collection`',
-                f'Expected coverartarchive to be in {collections}',
-                collections)
+                'coverartarchive' in ia_meta.collections,
+                f'Item not in coverartarchive collection, but in {ia_meta.collections}')
 
         # Metadata::item is noindex
-        actual_noindex, noindex_precheck = get_single('noindex', False, empty_ok=True)
-        yield noindex_precheck
-        yield self._simple_check(
-                'Metadata::item is noindex',
-                bool(actual_noindex),
-                'item is set to `noindex`',
-                'Expected item to be set to `noindex`',
-                actual_noindex)
+        self._check(
+                'Metadata::item is noindex', ia_meta.is_noindex,
+                'Item is not set to noindex')
 
         # Metadata::mediatype is image
-        actual_mediatype, mediatype_precheck = get_single('mediatype')
-        yield mediatype_precheck
-        yield self._simple_check(
-                'Metadata::mediatype is image',
-                actual_mediatype == 'image',
-                'item is of `image` media type',
-                'Expected item to be of `image` media type',
-                actual_mediatype)
+        self._check(
+                'Metadata::mediatype is image', ia_meta.mediatype == 'image',
+                f'Expected item to be of `image` media type, is actually {ia_meta.mediatype}')
 
         # Metadata::title correct
-        expected_title = mbstate["release_name"]
-        actual_title, title_precheck = get_single('title')
-        yield title_precheck
-        yield self._simple_check(
-                'Metadata::title correct',
-                actual_title == expected_title,
-                f'title is {expected_title}',
-                f'Expected title to be {expected_title}, got {actual_title}',
-                actual_title)
+        self._check(
+                'Metadata::title correct', ia_meta.title == mb_state.title,
+                f'Expected title to be {mb_state.title}, got {ia_meta.title}')
 
         # Metadata::creators correct
-        expected_creators = set(artist['artist_name'] for artist in mbstate['artists'])
-        actual_creators = set(get_as_list('creator'))
-        yield self._simple_check(
+        expected_creators = [artist.name for artist in mb_state.artists]
+        self._check(
                 'Metadata::creators correct',
-                actual_creators == expected_creators,
-                f'creators are {"; ".join(expected_creators)}',
-                f'Expected creators to be {"; ".join(expected_creators)}, got {"; ".join(actual_creators)}',
-                actual_creators)
+                ia_meta.creators == expected_creators,
+                f'Expected creators to be {"; ".join(expected_creators)}, got {"; ".join(ia_meta.creators)}')
 
         # Metadata::date correct
-        expected_date = set(mbstate['release_dates'])
-        exp_date_str = str(expected_date) if expected_date else '{}'
-        actual_date, date_precheck = get_single('date', empty_ok=True)
-        yield date_precheck
-        yield self._simple_check(
+        self._check(
                 'Metadata::date correct',
-                bool(expected_date) == bool(actual_date) and actual_date in expected_date,
-                f'date is in {exp_date_str}',
-                f'Expected date to be one of {exp_date_str}, got {actual_date}',
-                actual_date)
+                bool(ia_meta.date) == bool(mb_state.release_dates) and ia_meta.date in mb_state.release_dates,
+                f'Expected date to be one of {mb_state.release_dates}, got {ia_meta.date}')
 
         # Metadata::language correct
-        expected_language = mbstate['language_code']
-        actual_language, language_precheck = get_single('language', empty_ok=True)
-        yield self._simple_check(
-                'Metadata::language correct',
-                expected_language == actual_language,
-                f'language is {expected_language}',
-                f'Expected language to be {expected_language}, got {actual_language}',
-                actual_language)
+        self._check(
+                'Metadata::language correct', ia_meta.language == mb_state.language,
+                f'Expected language to be {mb_state.language}, got {ia_meta.language}')
 
-        external_ids = set(get_as_list('external-identifier'))
         expected_ext_ids = {
-            f'urn:mb_release_id:{mbstate["release_gid"]}',
-            *(f'urn:mb_artist_id:{artist["artist_gid"]}' for artist in mbstate['artists']),
-            *(f'urn:asin:{asin}' for asin in mbstate['asins']),
+            f'urn:mb_release_id:{mb_state.gid}',
+            *(f'urn:mb_artist_id:{artist.gid}' for artist in mb_state.artists),
+            *(f'urn:asin:{asin}' for asin in mb_state.asins),
         }
-        if mbstate['barcode']:
-            expected_ext_ids.add(f'urn:upc:{mbstate["barcode"]}')
+        if mb_state.barcode:
+            expected_ext_ids.add(f'urn:upc:{mb_state.barcode}')
+
         # Metadata::unexpected external id
-        for ext_id in external_ids:
+        for ext_id in ia_meta.external_ids:
             id_type = ext_id.split(':')[1]
-            yield self._simple_check(
-                    f'Metadata::unexpected external id {id_type}',
+            self._check(
+                    f'Metadata::unexpected external id::{id_type}',
                     ext_id in expected_ext_ids,
-                    f'{ext_id} is an expected identifier',
-                    f'{ext_id} should not be attached to this item',
-                    ext_id)
+                    f'Unexpected external ID {ext_id}')
 
         # Metadata::missing external id
         for ext_id in expected_ext_ids:
             id_type = ext_id.split(':')[1]
-            yield self._simple_check(
-                    f'Metadata::missing external id {id_type}',
-                    ext_id in external_ids,
-                    f'{ext_id} is attached to this item',
-                    f'{ext_id} is not attached to this item, but should be',
-                    ext_id)
+            self._check(
+                    f'Metadata::missing external id::{id_type}',
+                    ext_id in ia_meta.external_ids,
+                    f'Missing external ID {ext_id}')
 
         self._logger.info(
                 '*** Finished IA metadata checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
-    async def _run_files_checks(
-            self, ia_meta: dict[str, Any], mbstate: dict[str, Any],
-    ) -> AsyncIterable[CheckResult]:
+    def _run_files_checks(
+            self, ia_files: IAFiles, mb_state: MBState,
+    ) -> None:
         start_time = pendulum.now()
         self._logger.info('*** Starting IA files checks')
 
-        files = ia_meta.get('files', [])
-        def get_file(name: str) -> Optional[dict[str, str]]:
-            return next((f for f in files if f.get('name') == name), None)
-
-        def has_file(name: str) -> bool:
-            return get_file(name) is not None
-
         # Files::index.json exists
-        yield self._simple_check(
+        self._check(
                 'Files::index.json exists',
-                has_file('index.json'),
-                'index.json exists',
+                ia_files.has_original('index.json'),
                 'index.json is not in item file list')
 
         # Files::mb_metadata.xml exists
-        yield self._simple_check(
+        self._check(
                 'Files::mb_metadata.xml exists',
-                has_file(f'mbid-{self._mbid}_mb_metadata.xml'),
-                'mb_metadata.xml exists',
+                ia_files.has_original(f'mbid-{self._mbid}_mb_metadata.xml'),
                 'mb_metadata.xml is not in item file list')
 
+        for caa_image in mb_state.images:
+            self._run_image_check(caa_image, ia_files)
 
-        for image in mbstate['images']:
-            cover_id = image['id']
-            cover_ext = image['suffix']
-
-            # Files::original image exists
-            yield self._simple_check(
-                    'Files::original image exists',
-                    has_file(f'mbid-{self._mbid}-{cover_id}.{cover_ext}'),
-                    f'{cover_id} exists',
-                    f'{cover_id} is not in IA file list, possibly disastrous!')
-
-            # Files::250px thumbnail exists
-            # Files::500px thumbnail exists
-            # Files::1200px thumbnail exists
-            for thumbsize in ('250', '500', '1200'):
-                yield self._simple_check(
-                    f'Files::{thumbsize}px thumbnail exists',
-                    has_file(f'mbid-{self._mbid}-{cover_id}_thumb{thumbsize}.jpg'),
-                    f'{thumbsize}px thumbnail for {cover_id} exists',
-                    f'{thumbsize}px thumbnail for {cover_id} is not in IA file list, should be re-derived')
-
-            # Files::image id is unique
-            images_with_id = [
-                    f for f in files
-                    if (re.match(rf'mbid-{self._mbid}-{cover_id}\.[a-zA-Z0-9]+$', f.get('name', '')) is not None
-                        and f.get('source') == 'original')]
-            yield self._simple_check(
-                    'Files::image id is unique',
-                    len(images_with_id) == 1,
-                    f'{cover_id} has only one source file',
-                    f'Multiple source files for {cover_id} exist, this may lead to issues with derivation',
-                    images_with_id)
-
-            self._logger.info(
+        self._logger.info(
                 '*** Finished IA files checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
 
-    async def _run_index_checks(self, mbstate: dict[str, Any]) -> AsyncIterable[CheckResult]:
+    def _run_image_check(
+            self, caa_image: MBImage, ia_files: IAFiles
+    ) -> None:
+        self._logger.info(f'Checking image {caa_image.id}')
+
+        # Files::original image exists
+        self._check(
+                'Files::original image exists',
+                ia_files.has_original(caa_image.filename),
+                f'{caa_image.id} is not in IA file list, possibly disastrous!')
+
+        # Files::250px thumbnail exists
+        # Files::500px thumbnail exists
+        # Files::1200px thumbnail exists
+        for thumb_size, thumb_filename in caa_image.thumbnails.items():
+            self._check(
+                    f'Files::{thumb_size}px thumbnail exists',
+                    ia_files.has_derivative(thumb_filename),
+                    f'{thumb_size}px thumbnail for {caa_image.id} not in IA file list')
+
+        # Files::image id is unique
+        self._check(
+                'Files::image id is unique',
+                # Include extension in match, ...jpg_meta.txt shouldn't be counted
+                len(ia_files.find_originals(lambda iaf: re.match(rf'mbid-{self._mbid}-{caa_image.id}\.[a-zA-Z0-9]+$', iaf.name) is not None)) == 1,
+                f'Multiple source files for {caa_image.id} exist, this may lead to issues with derivation')
+
+    def _run_index_checks(self, index_raw: str, mb_state: MBState) -> None:
         start_time = pendulum.now()
         self._logger.info('*** Starting CAA index.json checks')
 
-        self._logger.info('Loading CAA index.json')
-        index_raw = await self._ia_item.caa_index
-
         # CAAIndex::is present
-        yield self._simple_check(
+        if not self._check(
                 'CAAIndex::is present',
                 index_raw is not None,
-                'index.json is present',
-                'index.json not present. Aborting rest of checks…')
-        if index_raw is None:
+                'index.json not present. Aborting rest of checks…'):
             return
 
         # CAAIndex::is well-formed
         self._logger.info('Attempting to parse index.json as JSON')
         try:
-            index = json.loads(index_raw)
-            yield CheckPassed(self._mbid, f'{self.base_category}::CAAIndex::is well-formed')
+            index = CAAIndex(index_raw)
         except json.JSONDecodeError as exc:
-            yield CheckFailed(self._mbid, f'{self.base_category}::CAAIndex::is well-formed', exc)
+            self._fail('CAAIndex::is well-formed')
             self._logger.error('index.json not well-formed!')
             self._logger.exception(exc)
             self._logger.error('Aborting rest of checks…')
             return
 
-        self._logger.info('index.json parsed successfully')
-
-        # CAAIndex::Schema::
-        outdated_schema = False
-        self._logger.info('Verifying index.json schema')
-        async for schema_check_result in self._verify_schema_rec(index, INDEX_SCHEMA, 'root', 'root'):
-            if isinstance(schema_check_result, CheckFailed):
-                outdated_schema = True
-            yield schema_check_result
-
-        # Don't check the index if its schema is outdated, otherwise we may run
-        # into non-existent keys
-        if outdated_schema:
-            self._logger.info('Schema verification encountered failures, aborting rest of index check…')
+        if not self._check(
+                'CAAIndex::is well-formed', index.is_dict,
+                'index.json is not well-formed, aborting…'):
             return
 
-        self._logger.info('Schema verification passed successfully')
+        self._logger.info('index.json parsed successfully')
+
+        if not self._check(
+                'CAAIndex::has all keys', {'release', 'images'}.issubset(index.keys()),
+                'CAA index missing a required key! Aborting…'):
+            return
+
+        self._check(
+                'CAAIndex::unexpected key', {'release', 'images'} == index.keys(),
+                f'CAA index has unexpected key: {index.keys()}')
 
         # CAAIndex::release url correct
-        yield self._simple_check(
+        self._check(
                 'CAAIndex::release url correct',
-                index['release'] == f'https://musicbrainz.org/release/{self._mbid}',
-                'release URL is correct',
-                'Encountered incorrect release URL!',
-                index['release'])
+                index.release_url == f'https://musicbrainz.org/release/{self._mbid}',
+                f'Encountered incorrect release URL: {index.release_url}')
 
-        cover_id_to_cover = {
-                cover['id']: cover for cover in mbstate['images']}
-        ia_images = index['images']
+        id_to_mb_image = {cover.id: cover for cover in mb_state.images}
+        idx_image_id_count: Counter[int] = Counter()
+        found_images: set[int] = set()
+        idx_order: list[int] = []
 
-        for cover_id in cover_id_to_cover:
-            matching_covers = [c for c in ia_images if c['id'] == cover_id]
-            # CAAIndex::Image::missing image
-            yield self._simple_check(
-                    'CAAIndex::Image::missing image',
-                    len(matching_covers) >= 1,
-                    f'{cover_id} exists in index.json',
-                    f'{cover_id} not present in index.json')
-
-            # CAAIndex::Image::image id is unique
-            yield self._simple_check(
-                    'CAAIndex::Image::image id is unique',
-                    len(matching_covers) <= 1,
-                    f'at most one image with {cover_id} exists in index.json',
-                    f'{cover_id} has multiple images',
-                    matching_covers)
-
-        for image in ia_images:
-            # CAAIndex::Image::unexpected image
-            yield self._simple_check(
-                    'CAAIndex::Image::unexpected image',
-                    image['id'] in cover_id_to_cover,
-                    f'{image["id"]} is an expected image',
-                    f'Unexpected image {image["id"]} in index.json')
-            if image['id'] not in cover_id_to_cover:
+        for idx_image in index.images:
+            if not self._check(
+                    'CAAIndex::Image::is well-formed', isinstance(idx_image, dict) and 'id' in idx_image,
+                    f'index image is not a dict: {idx_image}'):
                 continue
 
-            caa_image = cover_id_to_cover[image['id']]
-
-            # CAAIndex::Image::edit
-            edit_cr = self._simple_check(
-                    'CAAIndex::Image::edit',
-                    image['edit'] == caa_image['edit'],
-                    'edit is correct',
-                    f'Wrong edit ID for image {image["id"]}',
-                    image)
-            yield edit_cr
-
-            # CAAIndex::Image::edit approval status
-            if isinstance(edit_cr, CheckFailed):
-                self._logger.info('Skipping edit approval status check, edit is incorrect')
-                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::edit approval status')
+            if self._check(
+                    'CAAIndex::Image::id is int', isinstance(idx_image['id'], int),
+                    'index image id is not an int'):
+                idx_id = idx_image['id']
             else:
-                yield self._simple_check(
-                        'CAAIndex::Image::edit approval status',
-                        image['approved'] == caa_image['approved'],
-                        'edit approval status is correct',
-                        f'Wrong edit approval status for image {image["id"]}',
-                        image)
+                try:
+                    idx_id = int(idx_image['id'])
+                except ValueError as exc:
+                    self._logger.exception('Could not convert old-style id to int, skipping…')
+                    continue
 
-            # CAAIndex::Image::comment
-            yield self._simple_check(
-                    'CAAIndex::Image::comment',
-                    image['comment'] == caa_image['comment'],
-                    'comment is correct',
-                    f'Wrong comment for image {image["id"]}',
-                    image)
+            idx_order.append(idx_id)
 
-            # CAAIndex::Image::types
-            types_cr = self._simple_check(
-                    'CAAIndex::Image::types',
-                    image['types'] == caa_image['types'],
-                    'types are correct',
-                    f'Wrong types for image {image["id"]}',
-                    image)
-            yield types_cr
+            if not self._check(
+                    'CAAIndex::Image::unexpected image', idx_id in id_to_mb_image,
+                    f'index image {idx_id} not found in MB state, skipping…'):
+                continue
 
-            # CAAIndex::Image::front
-            # CAAIndex::Image::back
-            if isinstance(edit_cr, CheckFailed):
-                self._logger.info('Skipping front and back checks, types are incorrect')
-                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::front')
-                yield CheckSkipped(self._mbid, f'{self.base_category}::CAAIndex::Image::back')
-            else:
-                yield self._simple_check(
-                        'CAAIndex::Image::front',
-                        image['front'] == caa_image['front'],
-                        'main front status is correct',
-                        f'Wrong main front status for image {image["id"]}',
-                        image)
+            mb_image = id_to_mb_image[idx_id].as_dict()
 
-                yield self._simple_check(
-                        'CAAIndex::Image::front',
-                        image['back'] == caa_image['back'],
-                        'main back status is correct',
-                        f'Wrong main back status for image {image["id"]}',
-                        image)
+            for k in mb_image.keys():
+                if not self._check(
+                        f'CAAIndex::Image::has {k}', k in idx_image,
+                        f'Missing key {k} in image {idx_id}'):
+                    # Skip next check, key not found
+                    continue
+                self._check(
+                        f'CAAIndex::Image::{k} correct', idx_image[k] == mb_image[k],
+                        f'Incorrect value for {k} in {idx_id}: {idx_image[k]}')
 
-            # CAAIndex::Image::image url
-            yield self._simple_check(
-                    'CAAIndex::Image::image url',
-                    image['image'] == f'http://coverartarchive.org/release/{self._mbid}/{image["id"]}.{caa_image["suffix"]}',
-                    'image url is correct',
-                    f'Wrong image url for image {image["id"]}',
-                    image)
+            for k in idx_image.keys():
+                self._check(
+                        'CAAIndex::Image::unexpected key', k in mb_image,
+                        f'Unexpected key {k} in {idx_id}')
 
-            # CAAIndex::Image::thumbnails
-            exp_thumbnails = {
-                name: f'http://coverartarchive.org/release/{self._mbid}/{image["id"]}-{size}.jpg'
-                for name, size in (
-                    ('small', '250'), ('large', '500'),
-                    ('250', '250'), ('500', '500'), ('1200', '1200'))
-            }
-            yield self._simple_check(
-                    'CAAIndex::Image::thumbnails',
-                    image['thumbnails'] == exp_thumbnails,
-                    'image thumbnails are correct',
-                    f'Wrong thumbnails for image {image["id"]}',
-                    image)
+            idx_image_id_count[idx_id] += 1
+            found_images.add(idx_id)
+
+        for mb_id in id_to_mb_image.keys():
+            self._check(
+                    'CAAIndex::Image::missing image', mb_id in found_images,
+                    f'Missing image {mb_id}! Possibly disastrous!')
+
+        for img_id, img_count in idx_image_id_count.items():
+            self._check(
+                    'CAAIndex::Image::image id is unique', img_count == 1,
+                    f'{img_id} has multiple images')
 
         # CAAIndex::Image::order
-        caa_order = [image['id'] for image in mbstate['images']]
-        index_order = [image['id'] for image in ia_images]
-        yield self._simple_check(
-                'CAAIndex::Image::order',
-                caa_order == index_order,
-                'images are ordered correctly',
-                'Wrong order for images',
-                index_order)
+        mb_order = [image.id for image in mb_state.images]
+        self._check(
+                'CAAIndex::Image::order', mb_order == idx_order,
+                f'Wrong order for images: {idx_order} vs {mb_order}')
 
         self._logger.info(
                 '*** Finished CAA index.json checks (took {elapsed:0.4f}s)',
                 elapsed=(pendulum.now() - start_time).total_seconds())
-
-    async def _verify_schema_rec(
-            self, index: Any, schema: Any, path: str, full_path: str
-    ) -> AsyncIterable[CheckResult]:
-        if isinstance(schema, type):
-            exp_type = schema
-        else:
-            exp_type = type(schema)
-
-        cr = self._simple_check(
-                f'CAAIndex::Schema::{path} is {exp_type.__name__}',
-                isinstance(index, exp_type),
-                f'{full_path} is a {exp_type.__name__}',
-                f'{full_path} is a {type(index).__name__}, not a {exp_type.__name__}, aborting further checks along this path…',
-                (index, type(index)))
-        yield cr
-        if isinstance(cr, CheckFailed):
-            return
-
-        if isinstance(schema, dict):
-            # Check keys
-            # If we're in thumbnails, first check them all together, as we don't
-            # want to spam 3 audit failures on old-style thumbnails
-            if path == 'root.images[].thumbnails':
-                yield self._simple_check(
-                        f'CAAIndex::Schema::{path} is new-style',
-                        index.keys() == {'small', 'large', '250', '500', '1200'},
-                        f'{full_path} is new-style',
-                        f'{full_path} is not new-style and may lead to incompatibilities',
-                        index)
-            else:
-                for k in schema.keys():
-                    yield self._simple_check(
-                            f'CAAIndex::Schema::{k} in {path}',
-                            k in index,
-                            f'{k} is in {full_path}',
-                            f'Expected key {k} in {full_path}, but absent',
-                            index)
-
-                for k in index.keys() - schema.keys():
-                    yield self._simple_check(
-                            f'CAAIndex::Schema::unexpected {k} in {path}',
-                            True,
-                            f'{k} is expected in {full_path}',
-                            f'Unexpected key {k} in {full_path}',
-                            index)
-
-            # Check values
-            for k in schema.keys():
-                if k not in index:
-                    # Already warned previously
-                    self._logger.info(f'Skipping check for value of {k}, not present in index')
-                    continue
-
-                async for rec_cr in self._verify_schema_rec(
-                        index[k], schema[k], f'{path}.{k}', f'{full_path}.{k}'):
-                    yield rec_cr
-
-        elif isinstance(schema, list):
-            # Check each entry
-            subschema = schema[0]
-            ext_simple_path = f'{path}[]'
-            for el_idx, subindex in enumerate(index):
-                ext_full_path = f'{full_path}[{el_idx}]'
-                async for rec_cr in self._verify_schema_rec(
-                        subindex, subschema, ext_simple_path, ext_full_path):
-                    yield rec_cr

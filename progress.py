@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 
 import enlighten
+
+from abstractions import CheckStage
 
 class ProgressBar:
 
     bar_format = '{desc}{desc_pad}{percentage:3.0f}%|{bar}| ' + \
             '[{elapsed}<{eta}, {rate:.2f}{unit_pad}{unit}/s]'
+    _status_format_stage = ', '.join(
+            f'{{stage_{stage.name}}} {stage.name}'
+            for stage in sorted(CheckStage, key=lambda cs: cs.value))
     status_format = '{todo} to do, ' + \
             '{queued} queued, ' + \
-            '{pending} in progress, ' + \
+            '{pending} in progress (' + _status_format_stage + '), ' + \
             '{finished} finished ' + \
             '({success} successful, {failed} failed, {skipped} skipped)'
 
@@ -27,9 +33,9 @@ class ProgressBar:
         self.status = self.mgr.status_bar(
                 status_format=self.status_format,
                 queued=0, success=0, pending=0, skipped=0, failed=0, finished=0,
-                todo=total)
+                todo=total, **{f'stage_{stage.name}': 0 for stage in CheckStage})
 
-        self._lock = asyncio.Lock()
+        self._stage_count: Counter[CheckStage] = Counter()
 
     def __enter__(self) -> ProgressBar:
         return self
@@ -48,30 +54,35 @@ class ProgressBar:
             skipped=self.skipped.count,
             failed=self.failed.count,
             finished=self.success.count + self.skipped.count + self.failed.count,
-            todo=self.pending.total - self.pending.count)
+            todo=self.pending.total - self.pending.count,
+            **{f'stage_{stage.name}': self._stage_count[stage] for stage in CheckStage})
 
-    async def task_enqueued(self) -> None:
-        async with self._lock:
-            self.queued += 1
-            self._update_statusbar()
+    def task_enqueued(self) -> None:
+        self.queued += 1
+        self._update_statusbar()
 
-    async def task_running(self) -> None:
-        async with self._lock:
-            self.pending.update()
-            self.queued -= 1
-            self._update_statusbar()
+    def task_running(self) -> None:
+        self.pending.update()
+        self.queued -= 1
+        self._update_statusbar()
 
-    async def task_success(self) -> None:
-        async with self._lock:
-            self.success.update_from(self.pending)
-            self._update_statusbar()
+    def task_success(self) -> None:
+        self.success.update_from(self.pending)
+        self._update_statusbar()
 
-    async def task_failed(self) -> None:
-        async with self._lock:
-            self.failed.update_from(self.pending)
-            self._update_statusbar()
+    def task_failed(self) -> None:
+        self.failed.update_from(self.pending)
+        self._update_statusbar()
 
-    async def task_skipped(self) -> None:
-        async with self._lock:
-            self.skipped.update_from(self.pending)
-            self._update_statusbar()
+    def task_skipped(self) -> None:
+        self.skipped.update_from(self.pending)
+        self._update_statusbar()
+
+    def enter_stage(self, stage: CheckStage) -> None:
+        self._stage_count[stage] += 1
+        self._update_statusbar()
+
+    def exit_stage(self, stage: CheckStage) -> None:
+        self._stage_count[stage] -= 1
+        self._update_statusbar()
+

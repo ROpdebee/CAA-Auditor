@@ -27,6 +27,3 @@ class CheckPassed(CheckResult):
 
 class CheckFailed(CheckResult):
     check_state = 'FAILED'
-
-class CheckSkipped(CheckResult):
-    check_state = 'SKIPPED'
