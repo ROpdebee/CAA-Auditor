@@ -4,6 +4,7 @@ from typing import Any, NamedTuple, TYPE_CHECKING
 
 import asyncio
 import csv
+import gzip
 import os
 
 from collections import Counter, defaultdict
@@ -93,7 +94,9 @@ class ResultAggregator(ResultCollector):
         # results since there's a chance they won't all fit in memory at the
         # same time.
         root_path.mkdir(exist_ok=True, parents=True)
-        self._cache_file = (root_path / 'results_cache').open('w+')
+        self._cache_file_path = root_path / 'results_cache.gz'
+        self._cache_file = gzip.open(self._cache_file_path, mode='wt')
+        self._finished = False
 
     def put(self, audit_results: list[CheckResult]) -> None:
         skipped = failed = False
@@ -124,10 +127,15 @@ class ResultAggregator(ResultCollector):
         if self._internal_error_counter > 10:
             raise RuntimeError('Exceeded internal error counter, aborting.')
 
+    def finish(self) -> None:
+        self._cache_file.close()
+        self._finished = True
+
     def _iter_results(self) -> Iterable[ResultType]:
-        """Make sure to fully consume the results OR seek back to the end of the file manually!"""
-        self._cache_file.seek(0)
-        return (ResultType(*line.strip().split('\t')) for line in self._cache_file)
+        """finish must be called beforehand!"""
+        assert self._finished
+        with gzip.open(self._cache_file_path, mode='rt') as results_f:
+            yield from (ResultType(*line.strip().split('\t')) for line in results_f)
 
     def write_skipped_items_log(self, path: Path) -> None:
         with path.open('w') as out_f:

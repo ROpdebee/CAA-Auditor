@@ -155,6 +155,8 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int,
             for runner in runners:
                 runner.cancel()
 
+            aggregator.finish()
+
         aggregator.write_skipped_items_log(output_path / 'skipped_items.log')
         aggregator.write_failed_checks_log(output_path / 'failed_checks.log')
         aggregator.write_failures_csv(output_path / 'bad_items.csv')
