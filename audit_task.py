@@ -177,13 +177,6 @@ class AuditTask:
 
         ia_state = IAState(ia_state_raw)
 
-        self._logger.info('Checking whether there are any pending catalog tasks…')
-        if not self._check(
-                'has pending tasks', not await self._ia_item.has_pending_tasks(),
-                'Item has pending tasks and may get modified later. Aborting…',
-                self._item_skip):
-            return
-
         if not self._check(
                 'darkened', not ia_state.is_dark,
                 'Cannot audit this item since it is darkened. Aborting…',
