@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING
 
-import json
 import re
 from collections import defaultdict
 from enum import Enum
@@ -12,6 +11,8 @@ import pendulum
 
 if TYPE_CHECKING:
     from pendulum.datetime import DateTime
+
+from json_parser import JSONArray, JSONObject, parse as json_parse, safe_get, to_native as json_to_native
 
 class CheckStage(Enum):
     preprocess = 0
@@ -29,11 +30,11 @@ class IAState:
     is_dark: bool
     last_modified: DateTime
 
-    def __init__(self, d: dict[str, Any]) -> None:
-        self.files = IAFiles(d.get('files', []))
-        self.meta = IAMeta(d.get('metadata', {}))
-        self.is_dark = d.get('is_dark', False)
-        self.last_modified = pendulum.from_timestamp(d.get('item_last_updated', 0))
+    def __init__(self, d: JSONObject) -> None:
+        self.files = IAFiles(safe_get(d, 'files', []))
+        self.meta = IAMeta(safe_get(d, 'metadata', {}))
+        self.is_dark = safe_get(d, 'is_dark', False)
+        self.last_modified = pendulum.from_timestamp(safe_get(d, 'item_last_updated', 0))
 
 class IAFile:
 
@@ -44,11 +45,11 @@ class IAFile:
     is_historical: bool
     revno: Optional[int]
 
-    def __init__(self, filedata: dict[str, str]) -> None:
+    def __init__(self, filedata: JSONObject) -> None:
         self._d = filedata
-        self.original_name: str = filedata.get('name', '')
-        self.is_derived = filedata.get('source', 'original') == 'derivative'
-        self.original: Optional[str] = filedata.get('original')
+        self.original_name: str = safe_get(filedata, 'name', '')
+        self.is_derived = safe_get(filedata, 'source', 'original') == 'derivative'
+        self.original: Optional[str] = safe_get(filedata, 'original')
         self.is_historical = self.original_name.startswith('history/files/')
         self.name = self.original_name
         self.revno = None
@@ -59,11 +60,11 @@ class IAFile:
 
     @cached_property
     def last_modified(self) -> DateTime:
-        return pendulum.from_timestamp(int(self._d.get('mtime', 0)))
+        return pendulum.from_timestamp(int(safe_get(self._d, 'mtime', 0)))
 
 class IAFiles:
 
-    def __init__(self, filelist: list[dict[str, Any]]) -> None:
+    def __init__(self, filelist: JSONArray[JSONObject]) -> None:
         self._original_files = {}
         self._derived_files = {}
         self._history_files: dict[str, list[IAFile]] = defaultdict(list)
@@ -116,20 +117,20 @@ class IAMeta:
     date: Optional[str]
     language: Optional[str]
 
-    def __init__(self, metadict: dict[str, Any]) -> None:
+    def __init__(self, metadict: JSONObject) -> None:
         self._d = metadict
         self.external_ids = set(self._get_list('external-identifier'))
         self.collections = self._get_list('collection')
-        self.is_noindex = self._d.get('noindex', False)
+        self.is_noindex = safe_get(self._d, 'noindex', False)
         self.mediatype = self._d['mediatype']
-        self.title = self._d.get('title', '')
+        self.title = safe_get(self._d, 'title', '')
         self.creators = self._get_list('creator')
-        self.date = self._d.get('date')
-        self.language = self._d.get('language')
+        self.date = safe_get(self._d, 'date')
+        self.language = safe_get(self._d, 'language')
 
     def _get_list(self, key: str) -> list[Any]:
-        raw = self._d.get(key, [])
-        if isinstance(raw, list):
+        raw = safe_get(self._d, key, [])
+        if isinstance(raw, (list, JSONArray)):
             return raw
         return [raw]
 
@@ -144,14 +145,14 @@ class MBState:
     asins: list[str]
     images: list[MBImage]
 
-    def __init__(self, d: dict[str, Any]) -> None:
+    def __init__(self, d: JSONObject) -> None:
         self.gid = d['release_gid']
         self.title = d['release_name']
         self.artists = [MBArtist(a['artist_name'], a['artist_gid']) for a in d['artists']]
         self.release_dates = d['release_dates']
-        self.language = d.get('language_code')
-        self.barcode = d.get('barcode')
-        self.asins = d['asins']
+        self.language = safe_get(d, 'language_code')
+        self.barcode = safe_get(d, 'barcode')
+        self.asins = list(d['asins'])
         self.images = [MBImage(img, self.gid) for img in d['images']]
 
 
@@ -162,7 +163,7 @@ class MBArtist(NamedTuple):
 
 class MBImage:
 
-    def __init__(self, d: dict[str, Any], mbid: str) -> None:
+    def __init__(self, d: JSONObject, mbid: str) -> None:
         self._d = d
         self._mbid = mbid
         self.id = d['id']
@@ -175,7 +176,7 @@ class MBImage:
 
     def as_dict(self) -> dict[str, Any]:
         """Imitate the dict entry as it would appear in the index.json."""
-        d = dict(self._d)
+        d = json_to_native(self._d)
         suffix = d['suffix']
         del d['suffix']
         d['image'] = f'http://coverartarchive.org/release/{self._mbid}/{self.id}.{suffix}'
@@ -187,8 +188,10 @@ class MBImage:
 
 class CAAIndex:
 
-    def __init__(self, json_raw: str) -> None:
-        self._d = json.loads(json_raw)
+    _d: dict[str, Any]
+
+    def __init__(self, json_raw: bytes) -> None:
+        self._d = json_to_native(json_parse(json_raw))
 
     @property
     def is_dict(self) -> bool:

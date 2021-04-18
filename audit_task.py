@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
-import json
 import re
 import textwrap
 from collections import Counter, defaultdict
@@ -21,10 +20,10 @@ if TYPE_CHECKING:
     from loguru import Logger
     from pendulum.datetime import DateTime
 
+from abstractions import CAAIndex, CheckStage, IAFile, IAFiles, IAMeta, IAState, MBImage, MBState
 from audit_result import CheckFailed, CheckPassed, CheckResult, ItemSkipped
 from ia_item import IAItem
 from result_aggregator import ResultCollector
-from abstractions import CAAIndex, CheckStage, IAFile, IAFiles, IAMeta, IAState, MBImage, MBState
 
 
 class AuditTask:
@@ -391,7 +390,7 @@ class AuditTask:
                 len(ia_files.find_originals(lambda iaf: re.match(rf'mbid-{self._mbid}-{caa_image.id}\.[a-zA-Z0-9]+$', iaf.name) is not None)) == 1,
                 f'Multiple source files for {caa_image.id} exist, this may lead to issues with derivation')
 
-    def _run_index_checks(self, index_raw: str, mb_state: MBState) -> None:
+    def _run_index_checks(self, index_raw: bytes, mb_state: MBState) -> None:
         start_time = pendulum.now()
         self._logger.info('*** Starting CAA index.json checks')
 
@@ -406,7 +405,7 @@ class AuditTask:
         self._logger.info('Attempting to parse index.json as JSON')
         try:
             index = CAAIndex(index_raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
             self._fail('CAAIndex::is well-formed')
             self._logger.error('index.json not well-formed!')
             self._logger.exception(exc)

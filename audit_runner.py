@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Optional, TypeVar, TYPE_CHECKING
 
 import asyncio
-import json
 import os
 import random
 import sys
@@ -23,6 +22,7 @@ if TYPE_CHECKING:
 
 from abstractions import CheckStage
 from audit_task import AuditTask
+from json_parser import parse_str as json_parse_str
 from progress import ProgressBar
 from result_aggregator import ResultAggregator
 
@@ -57,7 +57,7 @@ async def create_tasks(
 ) -> tuple[dict[str, Any], AsyncIterable[tuple[AuditTask, LogQueue]]]:
     async with data_path.open('r') as data_f:
         meta_line = await anext(aiter(data_f))
-        audit_meta = json.loads(meta_line)
+        audit_meta = json_parse_str(meta_line)
         if audit_meta['state'] != 'meta':
             raise ValueError('Expected first line of task list to be meta record')
         return audit_meta, _create_task_stream(
@@ -72,13 +72,11 @@ async def _create_task_stream(
         _ = await task_f.readline()  # Skip over meta line
         while (lines := await task_f.readlines(2**26)):
             for data_line in lines:
-                mb_data = json.loads(data_line)
+                mb_data = json_parse_str(data_line)
                 task_path = AsyncPath(_fanout_path(root_path, mb_data['id']))
                 log_queue = LogQueue(task_path / 'audit_log')
                 task_logger = logger.bind(log_queue=log_queue)
-                yield AuditTask(
-                        mb_data, max_last_modified, task_path, aiosession,
-                        task_logger, ), log_queue
+                yield AuditTask(mb_data, max_last_modified, task_path, aiosession, task_logger), log_queue
 
 async def queue_tasks(
         tasks: AsyncIterable[tuple[AuditTask, LogQueue]], task_q: asyncio.Queue[tuple[AuditTask, LogQueue]],
