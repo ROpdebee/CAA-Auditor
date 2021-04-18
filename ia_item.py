@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, TYPE_CHECKING
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -107,7 +108,7 @@ class IAItem:
         return index_content
 
     @backoff.on_exception(
-            backoff.expo, (aiohttp.ClientError, IAException), max_tries=15,
+            backoff.expo, (aiohttp.ClientError, IAException, asyncio.TimeoutError), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def has_pending_tasks(self) -> bool:
         async with self._session.get('https://archive.org/services/tasks.php', params={
@@ -123,7 +124,7 @@ class IAItem:
             except ValueError as exc:
                 raise IAException('Unable to parse catalog summary') from exc
 
-    async def _load_from_cache(self, path: SafeAsyncPath) -> Optional[bytes]:
+    async def _load_from_cache(self, path: AsyncPath) -> Optional[bytes]:
         try:
             content = await path.read_bytes()
             self._logger.info(f'Loaded cached {path.name}')
@@ -133,7 +134,7 @@ class IAItem:
                 self._logger.error(f'Failed to load {path.name} from cache: {exc}')
             return None
 
-    async def _load_json_from_cache(self, path: SafeAsyncPath) -> Optional[JSONObject]:
+    async def _load_json_from_cache(self, path: AsyncPath) -> Optional[JSONObject]:
         raw = await self._load_from_cache(path)
         if raw is None:
             return None
@@ -145,7 +146,7 @@ class IAItem:
             return None
 
     @backoff.on_exception(
-            backoff.expo, (aiohttp.ClientError, IAException), max_tries=15,
+            backoff.expo, (aiohttp.ClientError, IAException, asyncio.TimeoutError), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _fetch_metadata(self) -> tuple[JSONObject, bytes]:
         """Fetch the metadata of the item.
@@ -175,7 +176,7 @@ class IAItem:
             return metadata, metadata_raw
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=15,
+            backoff.expo, (aiohttp.ClientError, asyncio.TimeoutError), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _fetch_index(self) -> Optional[bytes]:
         """Fetch the index.json of the item.
@@ -195,7 +196,7 @@ class IAItem:
             return await resp.read()
 
     @backoff.on_exception(
-            backoff.expo, aiohttp.ClientError, max_tries=15,
+            backoff.expo, (aiohttp.ClientError, asyncio.TimeoutError), max_tries=15,
             on_backoff=handle_backoff, on_success=handle_success, on_giveup=handle_giveup)
     async def _is_404(self) -> bool:
         self._logger.info(f'Checking whether {self._identifier} is 404')
