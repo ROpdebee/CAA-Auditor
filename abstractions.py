@@ -56,7 +56,9 @@ class IAFile:
         self.revno = None
         if self.is_historical:
             self.name = self.name.removeprefix('history/files/')
-            self.revno = int(re.search(r'~(\d+)~$', self.name).groups()[0])  # type: ignore[union-attr]
+            revno_match = re.search(r'~(\d+)~$', self.name)
+            if revno_match:
+                self.revno = int(revno_match.groups()[0])
             self.name = re.sub(r'~\d+~$', '', self.name)
 
     @cached_property
