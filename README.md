@@ -1,5 +1,5 @@
 # CAA Auditor
-Tool to audit items in the [CoverArtArchive](https://archive.org/details/)coverartarchive] collection in the [Internet Archive](https://archive.org/) against the state of [MusicBrainz](https://musicbrainz.org/) releases.
+Tool to audit items in the [CoverArtArchive](https://coverartarchive.org/) [collection](https://archive.org/details/coverartarchive) in the [Internet Archive](https://archive.org/) against the state of [MusicBrainz](https://musicbrainz.org/) releases.
 
 ## Requirements
 - Python 3.9
