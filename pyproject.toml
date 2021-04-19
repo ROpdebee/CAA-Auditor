@@ -1,9 +1,9 @@
 [tool.poetry]
-name = "caa_audit"
+name = "CAA-Auditor"
 version = "0.1.0"
-description = ""
+description = "Tool to audit CAA data"
 authors = ["Ruben Opdebeeck <ropdebee@vub.be>"]
-license = "GPL-2.0"
+license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.9"
