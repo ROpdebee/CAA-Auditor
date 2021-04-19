@@ -6,6 +6,7 @@ import asyncio
 import csv
 import gzip
 import os
+import sys
 
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 from tabulate import tabulate
+from tqdm import tqdm
 
 from audit_result import CheckFailed, CheckPassed, CheckResult, ItemSkipped
 from progress import ProgressBar
@@ -28,7 +30,9 @@ class RowType(NamedTuple):
     num_checks: str
     num_releases: str
     num_failed: str
+    perc_failed: str
     num_failed_releases: str
+    perc_failed_releases: str
 
 class TableType(NamedTuple):
     header: RowType
@@ -84,7 +88,7 @@ class ReasonCounter:
 class ResultAggregator(ResultCollector):
     """Aggregator for results provided by the tasks."""
 
-    def __init__(self, root_path: Path, progress: ProgressBar) -> None:
+    def __init__(self, root_path: Path, progress: ProgressBar, open_cache: bool = True) -> None:
         super().__init__()
         self._progress = progress
 
@@ -95,8 +99,9 @@ class ResultAggregator(ResultCollector):
         # same time.
         root_path.mkdir(exist_ok=True, parents=True)
         self._cache_file_path = root_path / 'results_cache.gz'
-        self._cache_file = gzip.open(self._cache_file_path, mode='wt')
-        self._finished = False
+        if open_cache:
+            self._cache_file = gzip.open(self._cache_file_path, mode='wt')
+        self._finished = not open_cache
 
     def put(self, audit_results: list[CheckResult]) -> None:
         skipped = failed = False
@@ -135,26 +140,27 @@ class ResultAggregator(ResultCollector):
         """finish must be called beforehand!"""
         assert self._finished
         with gzip.open(self._cache_file_path, mode='rt') as results_f:
-            yield from (ResultType(*line.strip().split('\t')) for line in results_f)
+            # Intern the loaded strings, they may be repeated often
+            yield from (ResultType(*map(sys.intern, line.strip().split('\t'))) for line in results_f)
 
-    def write_skipped_items_log(self, path: Path) -> None:
-        with path.open('w') as out_f:
-            for cr in self._iter_results():
+    def write_items_log(self, skipped_path: Path, failed_path: Path) -> None:
+        with skipped_path.open('w') as skipped_out, failed_path.open('w') as failed_out:
+            for cr in tqdm(self._iter_results(), desc='Load check results'):
                 if cr.check_state == 'ITEM SKIPPED':
-                    out_f.write(str(cr) + os.linesep)
+                    file = skipped_out
+                elif cr.check_state == 'FAILED':
+                    file = failed_out
+                else:
+                    continue
 
-    def write_failed_checks_log(self, path: Path) -> None:
-        with path.open('w') as out_f:
-            for cr in self._iter_results():
-                if cr.check_state == 'FAILED':
-                    out_f.write(str(cr) + os.linesep)
+                file.write(''.join([cr.mbid, '\t', cr.check_description, os.linesep]))
 
     def write_failures_csv(self, path: Path) -> None:
         fail_reasons: set[str] = set()
         failed_mbids: set[str] = set()
         failure_counter: Counter[tuple[str, str]] = Counter()
 
-        for cr in self._iter_results():
+        for cr in tqdm(self._iter_results(), desc='Load failures'):
             if cr.check_state != 'FAILED':
                 continue
             fail_reasons.add(cr.check_description)
@@ -163,14 +169,12 @@ class ResultAggregator(ResultCollector):
 
         fail_reasons_ordered = sorted(fail_reasons)
         header = ['mbid'] + fail_reasons_ordered
-        rows = [header]
-        for mbid in sorted(failed_mbids):
-            rows.append([mbid] + [str(failure_counter[mbid, reason]) for reason in fail_reasons_ordered])
 
         with path.open('w') as f:
             writer = csv.writer(f)
-            for row in rows:
-                writer.writerow(row)
+            writer.writerow(header)
+            for mbid in tqdm(sorted(failed_mbids), desc='Write failure rows'):
+                writer.writerow([mbid] + [str(failure_counter[mbid, reason]) for reason in fail_reasons_ordered])
 
     # Awfulness below…
     # Consider the return value opaque and to be processed further by the table
@@ -180,7 +184,7 @@ class ResultAggregator(ResultCollector):
         all_failed_releases: set[str] = set()
         check_counter: dict[str, ReasonCounter] = defaultdict(ReasonCounter)
 
-        for cr in self._iter_results():
+        for cr in tqdm(self._iter_results(), desc='Load check results'):
             check_counter[cr.check_description].add(cr)
             all_releases.add(cr.mbid)
             if cr.check_state == 'FAILED':
@@ -188,15 +192,15 @@ class ResultAggregator(ResultCollector):
 
         header: RowType = RowType('',
                 '#checks', '#checked rels',
-                '#failed', '#failed rels')
+                '#failed', '%failed', '#failed rels', '%failed rels')
         check_rows: list[RowType] = []
         item_skip_rows: list[RowType] = [
-            RowType('SKIPPED ITEMS', '', '', '', '')]
+            RowType('SKIPPED ITEMS', '', '', '', '', '', '')]
         total_num_checks = 0
         total_num_failed = 0
 
-        def c(count: int, total: int) -> str:
-            return f'{count} ({count / total :.2%})'
+        def p(count: int, total: int) -> str:
+            return f'{count / total :.2%}'
 
         for reason, counter in sorted(check_counter.items(), key=lambda kv: kv[0]):
             checks = counter.num_checks
@@ -210,14 +214,15 @@ class ResultAggregator(ResultCollector):
             check_rows.append(RowType(
                 reason,
                 str(checks), str(num_releases),
-                c(failed, checks), c(failed_rels, num_releases)))
+                str(failed), p(failed, checks),
+                str(failed_rels), p(failed_rels, num_releases)))
             if counter.num_skipped:
-                item_skip_rows.append(RowType(reason, '', '', str(counter.num_skipped), ''))
+                item_skip_rows.append(RowType(reason, '', '', str(counter.num_skipped), '', '', ''))
 
         total_row: RowType = RowType(
                 'TOTAL', str(total_num_checks), str(len(all_releases)),
-                c(total_num_failed, total_num_checks),
-                c(len(all_failed_releases), len(all_releases)),
+                str(total_num_failed), p(total_num_failed, total_num_checks),
+                str(len(all_failed_releases)), p(len(all_failed_releases), len(all_releases)),
         )
 
         return TableType(header, check_rows, item_skip_rows, total_row)

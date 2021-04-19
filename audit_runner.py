@@ -156,14 +156,28 @@ async def do_audit(mb_data_file_path: Path, output_path: Path, concurrency: int,
                 runner.cancel()
 
             aggregator.finish()
+        write_logs(output_path, aggregator)
+        write_failed_items(output_path, aggregator)
+        write_tables(output_path, aggregator)
 
-        aggregator.write_skipped_items_log(output_path / 'skipped_items.log')
-        aggregator.write_failed_checks_log(output_path / 'failed_checks.log')
+def write_logs(output_path: Path, aggregator: ResultAggregator) -> None:
+        loguru.logger.info('Writing items log')
+        aggregator.write_items_log(output_path / 'skipped_items.log', output_path / 'failed_checks.log')
+
+def write_failed_items(output_path: Path, aggregator: ResultAggregator) -> None:
+        loguru.logger.info('Writing failed items overview')
         aggregator.write_failures_csv(output_path / 'bad_items.csv')
+
+def write_tables(output_path: Path, aggregator: ResultAggregator) -> None:
+        loguru.logger.info('Generating table data')
         table_data = aggregator.generate_table_data()
+        loguru.logger.info('Writing results table')
         aggregator.write_plaintext_table(output_path / 'results_all.txt', table_data, only_failure_rows=False)
+        loguru.logger.info('Writing JIRA formatted overview')
         aggregator.write_jira_table(output_path / 'results_jira.txt', table_data)
+        loguru.logger.info('Writing condensed overview')
         aggregator.write_plaintext_table(output_path / 'results_condensed.txt', table_data)
+        loguru.logger.info('Generating final table')
         print(aggregator.get_terminal_table(table_data))
 
 
