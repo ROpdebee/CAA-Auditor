@@ -5,7 +5,7 @@ root_dir = Path(sys.argv[1])
 
 def convert(content: str) -> str:
     lines = content.split('\n')
-    lines = ['mbid-' + l.split('\t')[0] for l in lines]
+    lines = ['mbid-' + l.split('\t')[0] for l in lines if l]
     return '\n'.join(lines)
 
 (root_dir / 'send_ia').mkdir(exist_ok=True)
