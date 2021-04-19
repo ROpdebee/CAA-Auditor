@@ -104,6 +104,9 @@ An overview:
 - `prep_for_ia.py`: Convert `ia_*` files in the actionable results to a file that can be submitted to IA admins for auto-submit of simple fixes.
 - `transform_old_task_list.py`: Unused, legacy code to convert an old task list to new format.
 
+## Data
+The results of an auditing run, performed on 2021-04-19, is available at the [Internet Archive](https://archive.org/details/coverartarchive_audit_20210419).
+
 ## Architecture
 See `Architecture.md`.
 
